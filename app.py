@@ -867,4 +867,4 @@ with tabs[4]:
         st.markdown("### Coverage by country (focus countries)")
         st.dataframe(cov_tbl, use_container_width=True)
 
-st.caption("preprocess.py builds outputs once → app.py loads prepared outputs + caches heavy computations.")
+st.caption("")
