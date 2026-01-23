@@ -50,7 +50,7 @@ st.title("Health Facility Connectivity in Latin America and the Caribbean")
 SPEED_COLS = ["fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps"]
 
 # -----------------------------------------------------------------------------
-# IDB-inspired (not claiming official palette)
+# IDB-inspired colors (not claiming official palette)
 # -----------------------------------------------------------------------------
 IDB_COLORS = {
     "navy":   "#003A70",
@@ -77,8 +77,7 @@ PLOTLY_DISCRETE = [
 # =============================================================================
 def show_modal_disclaimer_once():
     """
-    Requirement: user wants a pop-up that disappears and leaves no UI behind.
-    This is only possible with st.dialog (Streamlit >= ~1.27).
+    True pop-up disclaimer. Leaves no content behind after user accepts.
     """
     if "disclaimer_dismissed" not in st.session_state:
         st.session_state["disclaimer_dismissed"] = False
@@ -90,9 +89,8 @@ def show_modal_disclaimer_once():
         st.error(
             "This app is configured to show a true pop-up disclaimer using `st.dialog()`, "
             "but your Streamlit version does not support it.\n\n"
-            "To enable the pop-up, upgrade Streamlit:\n"
-            "  pip install -U streamlit\n\n"
-            "After upgrading, restart `streamlit run app.py`."
+            "Upgrade Streamlit:\n  pip install -U streamlit\n\n"
+            "Then restart the app."
         )
         st.stop()
 
@@ -108,8 +106,6 @@ This dashboard was developed for **internal reference** to help understand healt
 - **Do not share externally.**
 - This is **not** an officially approved public dashboard.
 - Use is restricted to internal specialist workflows within the **Inter-American Development Bank (IDB)**.
-
-If you need a publicly shareable version, coordinate through the appropriate internal approval channels.
             """
         )
         if st.button("I understand — continue", type="primary", use_container_width=True):
@@ -122,15 +118,29 @@ If you need a publicly shareable version, coordinate through the appropriate int
 show_modal_disclaimer_once()
 
 # =============================================================================
-# Data loading (cached)
+# Data loading (cached) — IMPORTANT: lazy load population to avoid OOM
 # =============================================================================
 @st.cache_resource(show_spinner=False)
-def load_prepared() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, Dict]:
-    fac = gpd.read_parquet("./facilities_prepared.geoparquet")
-    countries = gpd.read_parquet("./countries.geoparquet")
-    pop = gpd.read_parquet("./population_points.geoparquet")
-    with open("./metadata.json", "r", encoding="utf-8") as f:
-        meta = json.load(f)
+def load_facilities_countries_metadata() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict]:
+    """
+    Load only the smaller / critical datasets at startup.
+    Population points are loaded lazily inside Tab 5.
+    """
+    try:
+        fac = gpd.read_parquet("./facilities_prepared.geoparquet")
+        countries = gpd.read_parquet("./countries.geoparquet")
+        with open("./metadata.json", "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as e:
+        st.error(
+            "Failed to load prepared files at startup.\n\n"
+            "Make sure these files exist in the repository root:\n"
+            "- facilities_prepared.geoparquet\n"
+            "- countries.geoparquet\n"
+            "- metadata.json\n\n"
+            f"Error: {repr(e)}"
+        )
+        st.stop()
 
     # Numeric coercions
     for c in SPEED_COLS:
@@ -140,10 +150,29 @@ def load_prepared() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFram
         if c in fac.columns:
             fac[c] = pd.to_numeric(fac[c], errors="coerce")
 
-    return fac, countries, pop, meta
+    return fac, countries, meta
 
 
-fac0, countries_gdf, pop_gdf, meta = load_prepared()
+@st.cache_resource(show_spinner=False)
+def load_population_points() -> gpd.GeoDataFrame:
+    """
+    Load population points only when needed (Tab 5).
+    This is usually the largest file and can crash Streamlit Cloud if loaded at startup.
+    """
+    try:
+        pop = gpd.read_parquet("./population_points.geoparquet")
+    except Exception as e:
+        st.error(
+            "Failed to load population_points.geoparquet.\n\n"
+            "If this file is tracked via Git LFS, confirm Streamlit Cloud pulled the real file "
+            "(not an LFS pointer).\n\n"
+            f"Error: {repr(e)}"
+        )
+        st.stop()
+    return pop
+
+
+fac0, countries_gdf, meta = load_facilities_countries_metadata()
 LAC_CRS = meta.get("crs", str(getattr(fac0, "crs", "")))
 POLY_KEY = "country" if "country" in countries_gdf.columns else None
 
@@ -254,7 +283,6 @@ def compute_high_speed_flag_country_type(
     return df, meta_out
 
 
-# Do NOT cache KPIs (avoid stale values)
 def compute_kpis_map(df: pd.DataFrame) -> Dict[str, float]:
     total = len(df)
     if total == 0:
@@ -344,13 +372,6 @@ def regional_gaps(_df: pd.DataFrame, level: str, ref_stat: str, group_stat: str,
     return agg.sort_values("Gap (Mbps)"), lac_ref
 
 
-def _metric_crs_for_buffer(lac_crs_str: str) -> CRS:
-    c = CRS.from_user_input(lac_crs_str)
-    if not c.is_geographic:
-        return c
-    return CRS.from_epsg(3857)
-
-
 @st.cache_data(show_spinner=True)
 def population_coverage_cached(
     lac_crs_str: str,
@@ -359,12 +380,14 @@ def population_coverage_cached(
     pop_weight_col: Optional[str],
     fac_geojson: bytes,
     pop_geojson: bytes,
-    scale_up: bool,
 ) -> Tuple[Dict, pd.DataFrame]:
     fac = gpd.GeoDataFrame.from_features(json.loads(fac_geojson.decode("utf-8")), crs=lac_crs_str)
     pop = gpd.GeoDataFrame.from_features(json.loads(pop_geojson.decode("utf-8")), crs=lac_crs_str)
 
-    metric_crs = _metric_crs_for_buffer(lac_crs_str)
+    # Buffer in metric CRS
+    c = CRS.from_user_input(lac_crs_str)
+    metric_crs = c if (c and not c.is_geographic) else CRS.from_epsg(3857)
+
     fac_m = fac.to_crs(metric_crs)
     pop_m = pop.to_crs(metric_crs)
 
@@ -402,28 +425,8 @@ def population_coverage_cached(
     return overall, tbl
 
 
-def _center_zoom_from_bbox(minx, miny, maxx, maxy) -> Tuple[Dict[str, float], float]:
-    center = {"lon": (minx + maxx) / 2.0, "lat": (miny + maxy) / 2.0}
-    span = max(maxx - minx, maxy - miny)
-    if span <= 1:
-        zoom = 7
-    elif span <= 2:
-        zoom = 6
-    elif span <= 5:
-        zoom = 5
-    elif span <= 10:
-        zoom = 4
-    elif span <= 20:
-        zoom = 3.5
-    elif span <= 40:
-        zoom = 3
-    else:
-        zoom = 2.3
-    return center, zoom
-
-
 # =============================================================================
-# Sidebar controls (same logic, cleaned labels)
+# Sidebar controls
 # =============================================================================
 with st.sidebar:
     st.header("Global controls")
@@ -482,7 +485,7 @@ with st.sidebar:
 # =============================================================================
 fac1 = add_selected_speed(fac0, direction, network_mode)
 fac_global = filter_facilities_types_speed(fac1, sel_types, require_speed)
-fac_global_hs, _hs_meta = compute_high_speed_flag_country_type(fac_global, hs_mode, quantile_spec, cutoff_map)
+fac_global_hs, _ = compute_high_speed_flag_country_type(fac_global, hs_mode, quantile_spec, cutoff_map)
 
 # Focus subset for Map + Population Coverage only
 fac_focus = fac_global_hs.copy()
@@ -583,17 +586,6 @@ with tabs[0]:
             fig2.update_traces(marker={"size": 5})
             for tr in fig2.data:
                 fig.add_trace(tr)
-
-        if focus_countries and POLY_KEY == "country":
-            try:
-                cou = countries_gdf[countries_gdf["country"].isin(focus_countries)].copy()
-                if not cou.empty:
-                    cou_ll = cou.to_crs("EPSG:4326")
-                    minx, miny, maxx, maxy = cou_ll.total_bounds
-                    center, zoom = _center_zoom_from_bbox(minx, miny, maxx, maxy)
-                    fig.update_layout(mapbox=dict(center=center, zoom=zoom))
-            except Exception:
-                pass
 
         fig.update_layout(
             mapbox_style="open-street-map",
@@ -746,7 +738,7 @@ with tabs[3]:
             st.plotly_chart(fig2, use_container_width=True)
 
 # =============================================================================
-# TAB 5: Population Coverage
+# TAB 5: Population Coverage  (LAZY LOAD)
 # =============================================================================
 with tabs[4]:
     st.subheader("Population coverage (focus countries)")
@@ -758,14 +750,16 @@ with tabs[4]:
         """
     )
 
-    pop_weight_col = meta.get("population_weight_col", None)
-
-    if "country" not in pop_gdf.columns:
-        st.error("population_points.geoparquet is missing `country`. Re-run preprocess.py.")
-        st.stop()
-
     if not focus_countries:
         st.warning("Select 1+ focus countries in the sidebar to compute coverage.")
+        st.stop()
+
+    # Lazy load here (prevents crash right after disclaimer)
+    pop_gdf = load_population_points()
+
+    pop_weight_col = meta.get("population_weight_col", None)
+    if "country" not in pop_gdf.columns:
+        st.error("population_points.geoparquet is missing `country`. Re-run preprocess.py.")
         st.stop()
 
     radius_km = st.slider("Catchment radius (km)", min_value=1, max_value=100, value=10, step=1)
@@ -778,33 +772,19 @@ with tabs[4]:
 
     pop_for_cov_full = pop_gdf[pop_gdf["country"].isin(focus_countries)].copy()
 
-    MAX_POP_POINTS = 3_000_000
+    MAX_POP_POINTS = 1_200_000  # tighter limit for cloud safety
     approximate = False
     sample_n = None
-    scale_up = False
 
     if len(pop_for_cov_full) > MAX_POP_POINTS:
-        st.warning(f"Population points are large for the selected focus countries ({len(pop_for_cov_full):,}). Sampling is recommended.")
-        approximate = st.checkbox("Approximate using a sample of population points", value=True)
-        if approximate:
-            sample_n = st.slider("Sample size (population points)", 200_000, MAX_POP_POINTS, 1_000_000, step=100_000)
-            if pop_weight_col and pop_weight_col in pop_for_cov_full.columns:
-                scale_up = st.checkbox("Scale results up using population weights (approximate)", value=True)
-        else:
-            st.error("Turn on approximation or reduce focus countries.")
-            st.stop()
+        st.warning(f"Population points are very large for selected focus countries ({len(pop_for_cov_full):,}). Sampling is required on Streamlit Cloud.")
+        approximate = True
+        sample_n = st.slider("Sample size (population points)", 200_000, MAX_POP_POINTS, 800_000, step=100_000)
 
     if approximate and sample_n is not None:
         pop_for_cov = pop_for_cov_full.sample(n=min(sample_n, len(pop_for_cov_full)), random_state=42).copy()
-        if scale_up and pop_weight_col and pop_weight_col in pop_for_cov_full.columns:
-            full_sum = float(pd.to_numeric(pop_for_cov_full[pop_weight_col], errors="coerce").fillna(0).sum())
-            samp_sum = float(pd.to_numeric(pop_for_cov[pop_weight_col], errors="coerce").fillna(0).sum())
-            scale_factor = (full_sum / samp_sum) if samp_sum > 0 else 1.0
-        else:
-            scale_factor = 1.0
     else:
         pop_for_cov = pop_for_cov_full
-        scale_factor = 1.0
 
     payload = {
         "focus_countries": sorted(focus_countries),
@@ -815,8 +795,6 @@ with tabs[4]:
         "network_mode": network_mode,
         "radius_km": float(radius_km),
         "pop_points_used": int(len(pop_for_cov)),
-        "approximate": bool(approximate),
-        "scale_up": bool(scale_up),
     }
     filter_hash = _stable_hash(payload)
 
@@ -835,15 +813,7 @@ with tabs[4]:
             pop_weight_col=pop_weight_col,
             fac_geojson=fac_geojson,
             pop_geojson=pop_geojson,
-            scale_up=bool(scale_up),
         )
-
-    if approximate and scale_up and pop_weight_col and str(overall.get("metric", "")).startswith("sum"):
-        overall_scaled = overall.copy()
-        overall_scaled["covered"] = overall_scaled["covered"] * scale_factor
-        overall_scaled["total"] = overall_scaled["total"] * scale_factor
-        overall_scaled["pct_covered"] = 100.0 * overall_scaled["covered"] / overall_scaled["total"] if overall_scaled["total"] > 0 else 0.0
-        overall = overall_scaled
 
     a, b, c = st.columns(3)
     if str(overall.get("metric", "")).startswith("sum"):
@@ -859,8 +829,13 @@ with tabs[4]:
     not_cov = max(total - covered, 0)
 
     pie_df = pd.DataFrame({"Status": ["Covered", "Not covered"], "Value": [covered, not_cov]})
-    pie_fig = px.pie(pie_df, names="Status", values="Value", title="Overall coverage: covered vs not covered",
-                     color_discrete_sequence=[IDB_COLORS["teal"], IDB_COLORS["gray"]])
+    pie_fig = px.pie(
+        pie_df,
+        names="Status",
+        values="Value",
+        title="Overall coverage: covered vs not covered",
+        color_discrete_sequence=[IDB_COLORS["teal"], IDB_COLORS["gray"]],
+    )
     st.plotly_chart(pie_fig, use_container_width=True)
 
     if cov_tbl is not None and not cov_tbl.empty:
