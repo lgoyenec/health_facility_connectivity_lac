@@ -1,290 +1,196 @@
-"""
-Health Facility Connectivity Dashboard (LAC) — Thin Streamlit App
------------------------------------------------------------------
-
-Run:
-  streamlit run app.py
-
-Prerequisite (build prepared files once):
-  python preprocess.py
-"""
+# app.py
+# Run:
+#   streamlit run app.py
 
 import json
 import hashlib
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
-from shapely.ops import unary_union
-from pyproj import CRS
-
-# -----------------------------------------------------------------------------
-# Streamlit setup
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Health Facility Connectivity — IDB (Internal)", layout="wide")
-
-st.markdown(
-    """
-<style>
-.sidebar-note {
-    font-size: 0.85rem;
-    color: #6B7280;
-    font-style: italic;
-    margin-top: -8px;
-    margin-bottom: 8px;
-}
-div[data-testid="stMetricLabel"] > div {
-    font-size: 0.9rem;
-}
-</style>
-""",
-    unsafe_allow_html=True,
+# ---------------------------
+# Page setup
+# ---------------------------
+st.set_page_config(
+    page_title="Health facility connectivity (LAC)",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("Health Facility Connectivity in Latin America and the Caribbean")
-
-SPEED_COLS = ["fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps"]
-
-# -----------------------------------------------------------------------------
-# IDB-inspired colors (not claiming official palette)
-# -----------------------------------------------------------------------------
+# ---------------------------
+# Constants / style
+# ---------------------------
 IDB_COLORS = {
-    "navy":   "#003A70",
-    "teal":   "#00A3A6",
-    "orange": "#F28C28",
-    "gray":   "#6B7280",
-    "red":    "#D62728",
-    "green":  "#2CA02C",
+    "navy": "#002D72",     # IDB-ish dark blue
+    "orange": "#FF6A13",   # contrast for hospitals
+    "teal": "#00A3AD",
+    "gray": "#6B7280",
+    "light": "#F3F4F6",
+    "red": "#C81E1E",
+    "green": "#0E9F6E",
 }
-PLOTLY_DISCRETE = [
-    IDB_COLORS["navy"],
-    IDB_COLORS["teal"],
-    IDB_COLORS["orange"],
-    "#9467BD",
-    "#8C564B",
-    "#E377C2",
-    "#7F7F7F",
-    "#BCBD22",
-    "#17BECF",
-]
 
-# =============================================================================
-# TRUE POP-UP disclaimer (requires st.dialog)
-# =============================================================================
-def show_modal_disclaimer_once():
-    if "disclaimer_dismissed" not in st.session_state:
-        st.session_state["disclaimer_dismissed"] = False
+MAP_DEFAULT_CAP = 5_000
+MAP_HARD_CAP = 15_000  # never send more than this to browser
 
-    if st.session_state["disclaimer_dismissed"]:
-        return
+POP_DEFAULT_CAP = 150_000  # population points sampled for the map/estimates
+FAC_BUFFER_CAP = 2_000     # facilities used for buffers to prevent OOM
 
-    if not hasattr(st, "dialog"):
-        st.error(
-            "This app shows a true pop-up disclaimer using `st.dialog()`, "
-            "but your Streamlit version does not support it.\n\n"
-            "Upgrade Streamlit:\n  pip install -U streamlit\n\n"
-            "Then restart the app."
-        )
-        st.stop()
-
-    @st.dialog("Internal-use disclaimer", width="large")
-    def _dlg():
-        st.markdown(
-            """
-### Internal dashboard (not public)
-
-This dashboard was developed for **internal reference** to help understand health facility connectivity patterns across **Latin America and the Caribbean**.
-
-**Important:**
-- **Do not share externally.**
-- This is **not** an officially approved public dashboard.
-- Use is restricted to internal specialist workflows within the **Inter-American Development Bank (IDB)**.
-            """
-        )
-        if st.button("I understand — continue", type="primary", use_container_width=True):
-            st.session_state["disclaimer_dismissed"] = True
-            st.rerun()
-
-    _dlg()
-
-
-show_modal_disclaimer_once()
-
-# =============================================================================
-# Data loading (cached) — IMPORTANT: lazy load population to avoid OOM
-# =============================================================================
-@st.cache_resource(show_spinner=False)
-def load_facilities_countries_metadata() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict]:
-    try:
-        fac = gpd.read_parquet("./facilities_prepared.geoparquet")
-        countries = gpd.read_parquet("./countries.geoparquet")
-        with open("./metadata.json", "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception as e:
-        st.error(
-            "Failed to load prepared files at startup.\n\n"
-            "Make sure these files exist in the repository root:\n"
-            "- facilities_prepared.geoparquet\n"
-            "- countries.geoparquet\n"
-            "- metadata.json\n\n"
-            f"Error: {repr(e)}"
-        )
-        st.stop()
-
-    for c in SPEED_COLS:
-        if c in fac.columns:
-            fac[c] = pd.to_numeric(fac[c], errors="coerce")
-    for c in ["lat", "lon"]:
-        if c in fac.columns:
-            fac[c] = pd.to_numeric(fac[c], errors="coerce")
-
-    return fac, countries, meta
-
-
-@st.cache_resource(show_spinner=False)
-def load_population_points() -> gpd.GeoDataFrame:
-    try:
-        pop = gpd.read_parquet("./population_points.geoparquet")
-    except Exception as e:
-        st.error(
-            "Failed to load population_points.geoparquet.\n\n"
-            "If this file is tracked via Git LFS, confirm Streamlit Cloud pulled the real file "
-            "(not an LFS pointer).\n\n"
-            f"Error: {repr(e)}"
-        )
-        st.stop()
-    return pop
-
-
-fac0, countries_gdf, meta = load_facilities_countries_metadata()
-LAC_CRS = meta.get("crs", str(getattr(fac0, "crs", "")))
-
-# =============================================================================
-# Dashboard usage instructions
-# =============================================================================
-with st.expander("How to use this dashboard", expanded=False):
-    st.markdown(
-        """
-### What controls do what?
-
-**A) Selected speed (used everywhere)**
-- **Direction**: Download vs Upload  
-- **Network mode**:
-  - Fixed = fixed broadband
-  - Mobile = mobile
-  - Best available = max(fixed, mobile)
-  - Both (min) = min(fixed, mobile) (conservative)
-
-**B) High-speed (used everywhere)**
-- **Quantile** = computed **within each country × facility type**
-- **Manual** = you set a cutoff per facility type
-
-**C) Country focus**
-- To keep performance stable, the country focus is **single-country only** (or **All LAC**).
-- It affects **only**:
-  - *Facilities Map*
-  - *Population Coverage*
-- Other tabs remain **LAC-wide** (because they already summarize across all countries).
-        """
-    )
-
-# =============================================================================
+# ---------------------------
 # Helpers
-# =============================================================================
-def _stable_hash(payload: Dict) -> str:
-    return hashlib.md5(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+# ---------------------------
+def _safe_pct(num: float, den: float) -> float:
+    if den <= 0:
+        return 0.0
+    return 100.0 * num / den
 
 
 def _is_hospital_type(tp: str) -> bool:
-    return "hosp" in str(tp).lower()
+    if tp is None:
+        return False
+    s = str(tp).lower()
+    return ("hosp" in s) or ("hospital" in s)
 
 
-@st.cache_data(show_spinner=False)
-def add_selected_speed(_df: pd.DataFrame, direction: str, network_mode: str) -> pd.DataFrame:
-    df = _df.copy()
+def _hash_filters(items) -> str:
+    s = json.dumps(items, sort_keys=True, default=str)
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-    if direction == "Download":
-        fix = df["fix_dl_mbps"]
-        mob = df["mob_dl_mbps"]
-    else:
-        fix = df["fix_ul_mbps"]
-        mob = df["mob_ul_mbps"]
 
+@st.cache_resource
+def load_metadata():
+    p = Path("./metadata.json")
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+@st.cache_resource
+def load_facilities():
+    return gpd.read_parquet("./facilities_prepared.geoparquet")
+
+
+@st.cache_resource
+def load_countries():
+    return gpd.read_parquet("./countries.geoparquet")
+
+
+@st.cache_resource
+def load_population_points():
+    return gpd.read_parquet("./population_points.geoparquet")
+
+
+def add_selected_speed(df: pd.DataFrame, direction: str, network_mode: str) -> pd.DataFrame:
+    """
+    Adds:
+      - selected_speed_mbps
+      - has_fix, has_mob, has_speed
+      - speed_source
+    Uses ONLY columns that preprocessing prepared.
+    """
+    out = df.copy()
+
+    fix = "fix_dl_mbps" if direction == "Download" else "fix_ul_mbps"
+    mob = "mob_dl_mbps" if direction == "Download" else "mob_ul_mbps"
+
+    # ensure numeric (robust)
+    for c in [fix, mob, "fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    out["has_fix"] = out[fix].notna()
+    out["has_mob"] = out[mob].notna()
+    out["has_speed"] = out["has_fix"] | out["has_mob"]
+
+    # Selected speed logic
     if network_mode == "Fixed":
-        sel = fix
+        out["selected_speed_mbps"] = out[fix]
     elif network_mode == "Mobile":
-        sel = mob
-    elif network_mode == "Best available":
-        sel = pd.concat([fix, mob], axis=1).max(axis=1, skipna=True)
-    elif network_mode == "Both (min)":
-        sel = pd.concat([fix, mob], axis=1).min(axis=1, skipna=True)
+        out["selected_speed_mbps"] = out[mob]
+    elif network_mode == "Best available (max)":
+        out["selected_speed_mbps"] = np.nanmax(np.vstack([out[fix].to_numpy(), out[mob].to_numpy()]), axis=0)
+        out.loc[~out["has_speed"], "selected_speed_mbps"] = np.nan
+    elif network_mode == "Both (min, conservative)":
+        out["selected_speed_mbps"] = np.nanmin(np.vstack([out[fix].to_numpy(), out[mob].to_numpy()]), axis=0)
+        out.loc[~out["has_speed"], "selected_speed_mbps"] = np.nan
     else:
-        sel = pd.concat([fix, mob], axis=1).max(axis=1, skipna=True)
+        out["selected_speed_mbps"] = np.nan
 
-    df["selected_speed_mbps"] = sel
-    return df
+    # Speed source category
+    def _src(row):
+        if row["has_fix"] and row["has_mob"]:
+            return "Fixed+Mobile"
+        if row["has_fix"]:
+            return "Fixed only"
+        if row["has_mob"]:
+            return "Mobile only"
+        return "No data"
+
+    out["speed_source"] = out.apply(_src, axis=1)
+    return out
 
 
-@st.cache_data(show_spinner=False)
-def filter_facilities_types_speed(_df: pd.DataFrame, types: List[str], require_speed: bool) -> pd.DataFrame:
-    df = _df.copy()
-    if types:
-        df = df[df["tp_stbl"].isin(types)]
-    if require_speed:
-        df = df[df["has_speed"]]
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def compute_high_speed_flag_country_type(
-    _df: pd.DataFrame,
+def add_high_speed_flag(
+    df: pd.DataFrame,
     mode: str,
-    quantile_spec: str,
-    cutoff_map: Dict[str, float],
-) -> Tuple[pd.DataFrame, Dict]:
-    df = _df.copy()
-    df["high_speed"] = False
-    df.loc[df["selected_speed_mbps"].isna(), "high_speed"] = False
+    quantile_kind: str,
+    type_scope: str,
+    cutoff_by_type: dict,
+) -> pd.DataFrame:
+    """
+    Adds boolean high_speed following your dashboard rules.
 
-    meta_out: Dict = {}
+    IMPORTANT: Quantiles are computed WITHIN EACH COUNTRY and facility type.
+    """
+    out = df.copy()
+    out["high_speed"] = False
 
-    if mode == "Quantile":
-        q = 0.75 if quantile_spec == "Quartile (top 25%)" else (2 / 3)
-        for (ctry, t), sub in df.groupby(["country", "tp_stbl"], dropna=False):
-            vals = sub["selected_speed_mbps"].dropna()
-            thr = vals.quantile(q) if len(vals) else np.nan
-            if pd.notna(thr):
-                df.loc[sub.index, "high_speed"] = sub["selected_speed_mbps"] >= thr
-        meta_out = {"mode": "Quantile", "quantile": q, "grouping": "country × tp_stbl"}
+    s = out["selected_speed_mbps"]
+
+    # no speed -> never high speed
+    out.loc[~out["has_speed"], "high_speed"] = False
+
+    if mode == "Quantiles":
+        q = 0.75 if quantile_kind == "Quartile (top 25%)" else (2.0 / 3.0)
+
+        # Always compute within each country and tp_stbl (as requested)
+        group_cols = ["country", "tp_stbl"] if type_scope == "Within facility type" else ["country"]
+        # Compute threshold per group
+        th = out.groupby(group_cols, dropna=False)["selected_speed_mbps"].quantile(q)
+        th = th.reset_index().rename(columns={"selected_speed_mbps": "q_threshold"})
+        out = out.merge(th, on=group_cols, how="left")
+        out["high_speed"] = out["has_speed"] & (out["selected_speed_mbps"] >= out["q_threshold"])
+        out.drop(columns=["q_threshold"], inplace=True, errors="ignore")
+
     else:
-        for t, sub in df.groupby("tp_stbl", dropna=False):
-            thr = cutoff_map.get(str(t), np.nan)
-            if pd.notna(thr):
-                df.loc[sub.index, "high_speed"] = df.loc[sub.index, "selected_speed_mbps"] >= thr
-        meta_out = {"mode": "Manual", "grouping": "tp_stbl"}
+        # Manual cutoffs per tp_stbl
+        out["high_speed"] = False
+        for tp, cut in cutoff_by_type.items():
+            if cut is None:
+                continue
+            m = (out["tp_stbl"] == tp) & out["has_speed"]
+            out.loc[m, "high_speed"] = out.loc[m, "selected_speed_mbps"] >= float(cut)
 
-    df.loc[df["selected_speed_mbps"].isna(), "high_speed"] = False
-    return df, meta_out
+    return out
 
 
-def compute_kpis_map(df: pd.DataFrame) -> Dict[str, float]:
+def compute_map_kpis(df: pd.DataFrame) -> dict:
     total = len(df)
-    if total == 0:
-        return dict(total=0, pct_with_speed=0.0, pct_high_speed=0.0, pct_phc=0.0, pct_hosp=0.0)
+    pct_with = _safe_pct(df["has_speed"].sum(), total)
+    pct_high = _safe_pct(df["high_speed"].sum(), total)
 
-    pct_with = float(df["has_speed"].mean() * 100) if "has_speed" in df.columns else 0.0
-    pct_high = float(df["high_speed"].mean() * 100) if "high_speed" in df.columns else 0.0
-
-    hosp_mask = df["tp_stbl"].apply(_is_hospital_type)
-    pct_hosp = float(hosp_mask.mean() * 100)
-    pct_phc = 100.0 - pct_hosp
+    # mix
+    is_h = df["tp_stbl"].apply(_is_hospital_type)
+    pct_hosp = _safe_pct(is_h.sum(), total)
+    pct_phc = 100.0 - pct_hosp if total > 0 else 0.0
 
     return dict(
-        total=int(total),
+        total=total,
         pct_with_speed=pct_with,
         pct_high_speed=pct_high,
         pct_phc=pct_phc,
@@ -292,533 +198,699 @@ def compute_kpis_map(df: pd.DataFrame) -> Dict[str, float]:
     )
 
 
-@st.cache_data(show_spinner=False)
-def country_stats_table(_df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    d = _df.dropna(subset=["selected_speed_mbps"]).copy()
-    if d.empty:
-        return pd.DataFrame(columns=[
-            "Country", "Minimum speed (Mbps)", "P25 speed (Mbps)", "Median speed (Mbps)",
-            "P75 speed (Mbps)", "N facilities", "% below threshold"
-        ])
-
-    g = d.groupby("country")["selected_speed_mbps"]
-    out = pd.DataFrame({
-        "Country": g.apply(lambda x: x.name).values,
-        "Minimum speed (Mbps)": g.min().values,
-        "P25 speed (Mbps)": g.quantile(0.25).values,
-        "Median speed (Mbps)": g.median().values,
-        "P75 speed (Mbps)": g.quantile(0.75).values,
-        "N facilities": g.size().values,
-    })
-
-    below = (d["selected_speed_mbps"] < threshold).groupby(d["country"]).mean() * 100.0
-    out["% below threshold"] = out["Country"].map(below.to_dict()).fillna(0.0)
-    return out.sort_values("Median speed (Mbps)", ascending=True)
-
-
-@st.cache_data(show_spinner=False)
-def sample_for_distribution(_df: pd.DataFrame, per_country_cap: int = 1200, overall_cap: int = 45000) -> pd.DataFrame:
-    d = _df.dropna(subset=["selected_speed_mbps"]).copy()
-    if d.empty:
-        return d
-    parts = []
-    for ctry, sub in d.groupby("country"):
-        parts.append(sub.sample(n=min(per_country_cap, len(sub)), random_state=42))
-    out = pd.concat(parts, ignore_index=True)
-    if len(out) > overall_cap:
-        out = out.sample(n=overall_cap, random_state=42)
+def clean_latlon(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["lat"] = pd.to_numeric(out["lat"], errors="coerce")
+    out["lon"] = pd.to_numeric(out["lon"], errors="coerce")
+    out = out.dropna(subset=["lat", "lon"])
+    # LAC-ish bounds
+    out = out[out["lat"].between(-60, 35) & out["lon"].between(-120, -20)]
     return out
 
 
-@st.cache_data(show_spinner=False)
-def regional_gaps(_df: pd.DataFrame, level: str, ref_stat: str, group_stat: str, country_filter: Optional[List[str]] = None) -> Tuple[pd.DataFrame, float]:
-    d_all = _df["selected_speed_mbps"].dropna()
-    lac_ref = float(d_all.quantile(0.25)) if ref_stat == "P25" else float(d_all.median())
+def pretty_country_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    g = df[df["has_speed"]].copy()
+    if g.empty:
+        return pd.DataFrame(columns=[
+            "Country", "Facilities (with speed)", "Minimum speed (Mbps)", "P25 (Mbps)",
+            "Median (Mbps)", "P75 (Mbps)", f"% below {threshold:.1f} Mbps"
+        ])
 
-    if level == "Country":
-        keys = ["country"]
-    elif level == "ADM1":
-        keys = ["country", "ADM1_EN", "ADM1_PCODE"]
-    else:
-        keys = ["country", "ADM2_EN", "ADM2_PCODE"]
+    stats = g.groupby("country")["selected_speed_mbps"].agg(
+        count="count",
+        min="min",
+        median="median",
+    )
+    p25 = g.groupby("country")["selected_speed_mbps"].quantile(0.25).rename("p25")
+    p75 = g.groupby("country")["selected_speed_mbps"].quantile(0.75).rename("p75")
+    below = g.assign(below=g["selected_speed_mbps"] < threshold).groupby("country")["below"].mean().rename("pct_below")
 
-    d = _df.dropna(subset=["selected_speed_mbps"]).copy()
-    if country_filter and level in ["ADM1", "ADM2"]:
-        d = d[d["country"].isin(country_filter)].copy()
+    out = stats.join([p25, p75, below]).reset_index()
+    out["pct_below"] = out["pct_below"] * 100.0
 
-    if d.empty:
-        return pd.DataFrame(columns=keys + ["Group value (Mbps)", "LAC reference (Mbps)", "Gap (Mbps)", "Gap direction"]), lac_ref
+    out = out.rename(columns={
+        "country": "Country",
+        "count": "Facilities (with speed)",
+        "min": "Minimum speed (Mbps)",
+        "p25": "P25 (Mbps)",
+        "median": "Median (Mbps)",
+        "p75": "P75 (Mbps)",
+        "pct_below": f"% below {threshold:.1f} Mbps",
+    })
 
-    if group_stat == "Median":
-        agg = d.groupby(keys, as_index=False)["selected_speed_mbps"].median().rename(columns={"selected_speed_mbps": "Group value (Mbps)"})
-    else:
-        agg = d.groupby(keys, as_index=False)["selected_speed_mbps"].quantile(0.25).rename(columns={"selected_speed_mbps": "Group value (Mbps)"})
+    for c in ["Minimum speed (Mbps)", "P25 (Mbps)", "Median (Mbps)", "P75 (Mbps)"]:
+        out[c] = out[c].round(2)
+    out[f"% below {threshold:.1f} Mbps"] = out[f"% below {threshold:.1f} Mbps"].round(1)
 
-    agg["LAC reference (Mbps)"] = lac_ref
-    agg["Gap (Mbps)"] = agg["Group value (Mbps)"] - lac_ref
-    agg["Gap direction"] = np.where(agg["Gap (Mbps)"] < 0, "Below reference", "Above reference")
-    return agg.sort_values("Gap (Mbps)"), lac_ref
-
-
-# =============================================================================
-# Population coverage — avoid huge serialization + always sample by default
-# =============================================================================
-@st.cache_data(show_spinner=True)
-def population_coverage_cached(
-    filter_hash: str,
-    lac_crs_str: str,
-    radius_km: float,
-    pop_weight_col: Optional[str],
-    _fac_gdf: gpd.GeoDataFrame,
-    _pop_gdf: gpd.GeoDataFrame,
-) -> Tuple[Dict, pd.DataFrame]:
-    """
-    Cached by filter_hash (not by GeoDataFrames), while GeoDataFrames are passed
-    as underscore args (unhashed) to avoid Streamlit hashing errors and huge payloads.
-    """
-    # Buffer in metric CRS
-    c = CRS.from_user_input(lac_crs_str)
-    metric_crs = c if (c and not c.is_geographic) else CRS.from_epsg(3857)
-
-    fac_m = _fac_gdf.to_crs(metric_crs)
-    pop_m = _pop_gdf.to_crs(metric_crs)
-
-    radius_m = float(radius_km) * 1000.0
-    union_poly = unary_union(list(fac_m.geometry.buffer(radius_m).values))
-    union_gdf = gpd.GeoDataFrame({"_id": [1]}, geometry=[union_poly], crs=metric_crs)
-
-    covered = gpd.sjoin(pop_m, union_gdf, how="inner", predicate="within").drop(columns=["index_right"], errors="ignore")
-
-    if pop_weight_col and pop_weight_col in pop_m.columns:
-        cov_sum = float(pd.to_numeric(covered[pop_weight_col], errors="coerce").fillna(0).sum())
-        tot_sum = float(pd.to_numeric(pop_m[pop_weight_col], errors="coerce").fillna(0).sum())
-        pct = 100.0 * cov_sum / tot_sum if tot_sum > 0 else 0.0
-        overall = {"covered": cov_sum, "total": tot_sum, "pct_covered": pct, "metric": f"sum({pop_weight_col})"}
-    else:
-        cov_sum = int(len(covered))
-        tot_sum = int(len(pop_m))
-        pct = 100.0 * cov_sum / tot_sum if tot_sum > 0 else 0.0
-        overall = {"covered": cov_sum, "total": tot_sum, "pct_covered": pct, "metric": "# population points"}
-
-    if "country" not in pop_m.columns:
-        return overall, pd.DataFrame()
-
-    if pop_weight_col and pop_weight_col in pop_m.columns:
-        tot = pop_m.groupby("country", as_index=False)[pop_weight_col].sum().rename(columns={pop_weight_col: "Total"})
-        cov = covered.groupby("country", as_index=False)[pop_weight_col].sum().rename(columns={pop_weight_col: "Covered"})
-    else:
-        tot = pop_m.groupby("country", as_index=False).size().rename(columns={"size": "Total"})
-        cov = covered.groupby("country", as_index=False).size().rename(columns={"size": "Covered"})
-
-    tbl = tot.merge(cov, on="country", how="left").fillna({"Covered": 0})
-    tbl["% covered"] = np.where(tbl["Total"] > 0, 100.0 * tbl["Covered"] / tbl["Total"], 0.0)
-    tbl = tbl.sort_values("% covered", ascending=True)
-    tbl = tbl.rename(columns={"country": "Country"})
-    return overall, tbl
+    out = out.sort_values("Median (Mbps)", ascending=False)
+    return out
 
 
-# =============================================================================
+def chunked_union(polys, chunk_size=250):
+    # Avoid huge unary_union memory spikes by unioning in chunks
+    from shapely.ops import unary_union
+    polys = [p for p in polys if p is not None and not p.is_empty]
+    if not polys:
+        return None
+    chunks = []
+    for i in range(0, len(polys), chunk_size):
+        chunks.append(unary_union(polys[i:i + chunk_size]))
+    return unary_union(chunks)
+
+
+# ---------------------------
+# Disclaimer "popup" gate
+# ---------------------------
+if "ack_disclaimer" not in st.session_state:
+    st.session_state["ack_disclaimer"] = False
+
+if not st.session_state["ack_disclaimer"]:
+    st.title("Internal reference dashboard (IDB)")
+    st.warning(
+        "This dashboard is **for internal use within IDB** only and is **not publicly approved** for external sharing.\n\n"
+        "It is intended to support operational design and internal analysis."
+    )
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        if st.button("I understand — continue"):
+            st.session_state["ack_disclaimer"] = True
+            st.rerun()
+    with c2:
+        st.caption("If you are not an IDB staff/consultant working on internal operations, please close this page.")
+    st.stop()
+
+# ---------------------------
+# Load data
+# ---------------------------
+meta = load_metadata()
+fac = load_facilities()
+countries_gdf = load_countries()
+pop_gdf = load_population_points()
+
+# Basic validation / robustness
+for col in ["country", "tp_stbl", "lat", "lon"]:
+    if col not in fac.columns:
+        st.error(f"Missing required column in facilities_prepared: {col}")
+        st.stop()
+
+# ---------------------------
 # Sidebar controls
-# =============================================================================
+# ---------------------------
+st.title("Health facility connectivity in Latin America and the Caribbean")
+
 with st.sidebar:
     st.header("Global controls")
-    st.markdown('<div class="sidebar-note">Applies to all tabs.</div>', unsafe_allow_html=True)
+    st.caption("These controls apply to all tabs (speed definition and thresholds).")
 
-    direction = st.radio("Direction", ["Download", "Upload"], horizontal=True)
-    network_mode = st.selectbox("Network mode", ["Best available", "Fixed", "Mobile", "Both (min)"], index=0)
-
-    all_types = sorted(fac0["tp_stbl"].dropna().unique().tolist())
-    sel_types = st.multiselect("Facility types", all_types, default=all_types)
-
-    require_speed = st.checkbox("Only facilities with any speed", value=False)
+    direction = st.radio("Direction", ["Download", "Upload"], index=0)
+    network_mode = st.selectbox(
+        "Network mode",
+        ["Fixed", "Mobile", "Best available (max)", "Both (min, conservative)"],
+        index=2,
+    )
 
     st.divider()
     st.subheader("High-speed definition")
-    hs_mode = st.radio("Mode", ["Quantile", "Manual by type"], index=0)
-    if hs_mode == "Quantile":
-        quantile_spec = st.selectbox("Quantile (within country × type)", ["Quartile (top 25%)", "Tercile (top 33%)"], index=0)
-        cutoff_map = {}
-    else:
-        quantile_spec = "Quartile (top 25%)"
-        cutoff_map = {str(t): st.number_input(f"Cutoff for {t} (Mbps)", min_value=0.0, value=10.0, step=1.0) for t in all_types}
+    hs_mode = st.radio("Mode", ["Quantiles", "Manual cutoffs"], index=0)
 
-    st.divider()
-    country_threshold = st.number_input("Below-threshold if selected speed < (Mbps)", min_value=0.0, value=5.0, step=1.0)
+    # facility types
+    facility_types = sorted([x for x in fac["tp_stbl"].dropna().unique().tolist()])[:20]
+
+    if hs_mode == "Quantiles":
+        quantile_kind = st.selectbox("Quantile", ["Tercile (top 33%)", "Quartile (top 25%)"], index=0)
+        type_scope = st.selectbox("Compute quantiles", ["Within facility type", "Overall (ignore type)"], index=0)
+        manual_cutoffs = {}
+    else:
+        quantile_kind = "Tercile (top 33%)"
+        type_scope = "Within facility type"
+        st.caption("Set a Mbps cutoff per facility type.")
+        manual_cutoffs = {}
+        # show at most 2 most common types (your earlier constraint)
+        top_types = fac["tp_stbl"].value_counts().head(2).index.tolist()
+        for tp in top_types:
+            manual_cutoffs[tp] = st.number_input(f"Cutoff for {tp} (Mbps)", min_value=0.0, value=10.0, step=1.0)
 
     st.divider()
     st.header("Country focus")
-    st.markdown('<div class="sidebar-note">Single-country only (or All LAC). Applies to <i>Facilities Map</i> and <i>Population Coverage</i>.</div>', unsafe_allow_html=True)
+    st.caption("This filter applies only to: *Facilities Map* and *Population Coverage*.")
 
-    all_countries = sorted(fac0["country"].dropna().unique().tolist())
-    focus_option = ["All LAC"] + all_countries
-    focus_country = st.selectbox("Focus country", options=focus_option, index=0)
+    all_countries = sorted([c for c in fac["country"].dropna().unique().tolist()])
+    focus_country = st.selectbox("Focus country", ["All LAC"] + all_countries, index=0)
 
-# =============================================================================
-# Compute global derived data
-# =============================================================================
-fac1 = add_selected_speed(fac0, direction, network_mode)
-fac_global = filter_facilities_types_speed(fac1, sel_types, require_speed)
-fac_global_hs, _ = compute_high_speed_flag_country_type(fac_global, hs_mode, quantile_spec, cutoff_map)
+    # Map-specific filters
+    st.divider()
+    st.subheader("Map filters")
+    st.caption("Applied only in Facilities Map tab.")
 
-# Focus subset for Map + Population Coverage only
-fac_focus = fac_global_hs.copy()
-if focus_country != "All LAC":
-    fac_focus = fac_focus[fac_focus["country"] == focus_country].copy()
+    type_filter = st.multiselect("Facility type", options=sorted(fac["tp_stbl"].dropna().unique().tolist()),
+                                default=sorted(fac["tp_stbl"].dropna().unique().tolist()))
+    only_high_speed = st.checkbox("Show only high-speed facilities", value=False)
 
+    if st.button("Clear filters"):
+        # keep disclaimer acknowledged
+        keep_ack = st.session_state.get("ack_disclaimer", True)
+        st.session_state.clear()
+        st.session_state["ack_disclaimer"] = keep_ack
+        st.rerun()
+
+# ---------------------------
+# Derived data (fast, vectorized)
+# ---------------------------
+fac0 = add_selected_speed(fac, direction, network_mode)
+fac1 = add_high_speed_flag(
+    fac0,
+    mode=hs_mode,
+    quantile_kind=("Quartile (top 25%)" if quantile_kind.startswith("Quartile") else "Tercile (top 33%)"),
+    type_scope=type_scope,
+    cutoff_by_type=manual_cutoffs,
+)
+
+# Focus-country dataframe (ONLY used for tab 1 and tab 5)
+if focus_country == "All LAC":
+    fac_focus = fac1.copy()
+else:
+    fac_focus = fac1[fac1["country"] == focus_country].copy()
+
+# Map filters (type + high-speed)
+if type_filter:
+    fac_focus = fac_focus[fac_focus["tp_stbl"].isin(type_filter)].copy()
+if only_high_speed:
+    fac_focus = fac_focus[fac_focus["high_speed"]].copy()
+
+# ---------------------------
+# Tabs
+# ---------------------------
 tabs = st.tabs([
     "Facilities Map",
     "Country Distributions",
     "Regional Gaps",
     "Urban vs Rural",
-    "Population Coverage"
+    "Population Coverage",
 ])
 
 # =============================================================================
 # TAB 1: Facilities Map
 # =============================================================================
 with tabs[0]:
-    st.subheader("Facilities map (focus country)")
-    st.caption("Country focus affects only this tab and Population Coverage.")
+    st.markdown(
+        """
+**How to use this tab**
+- Choose **Direction** and **Network mode** in the sidebar (download/upload; fixed/mobile/best/min).
+- Define **High-speed** using **Quantiles** (within country & type) or **Manual cutoffs**.
+- Use **Focus country** to view one country or all LAC.
+- Use **Map filters** to restrict facility types or show only high-speed.
+        """
+    )
 
-    if focus_country == "All LAC":
-        st.warning("Focus country = All LAC. The map can be heavy; the app will downsample automatically if needed.")
+    # KPIs must reflect current filtered fac_focus
+    k = compute_map_kpis(fac_focus)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total facilities", f"{k['total']:,}")
+    c2.metric("% with any speed", f"{k['pct_with_speed']:.1f}%")
+    c3.metric("% high-speed", f"{k['pct_high_speed']:.1f}%")
+    c4.metric("% Primary care", f"{k['pct_phc']:.1f}%")
+    c5.metric("% Hospitals", f"{k['pct_hosp']:.1f}%")
+
+    df_map = clean_latlon(fac_focus)
+    if df_map.empty:
+        st.warning("No facilities with valid lat/lon for the current selection.")
+        st.stop()
+
+    # Keep hover light to avoid OOM/crashes
+    extended_hover = st.checkbox("Show extended hover details (slower)", value=False)
+    hover_basic = {
+        "country": True,
+        "tp_stbl": True,
+        "selected_speed_mbps": ":.2f",
+        "high_speed": True,
+    }
+    hover_extended = {
+        "country": True,
+        "tp_stbl": True,
+        "fix_dl_mbps": ":.2f",
+        "fix_ul_mbps": ":.2f",
+        "mob_dl_mbps": ":.2f",
+        "mob_ul_mbps": ":.2f",
+        "selected_speed_mbps": ":.2f",
+        "high_speed": True,
+        "speed_source": True,
+    }
+    hover_data = hover_extended if extended_hover else hover_basic
+
+    # Downsample aggressively
+    n = len(df_map)
+    st.caption(f"Facilities in selection: {n:,} (map will sample for stability if needed).")
+
+    # Reset show_more when focus_country changes
+    if "prev_focus_country" not in st.session_state:
+        st.session_state["prev_focus_country"] = focus_country
+    if st.session_state["prev_focus_country"] != focus_country:
+        st.session_state["show_more_points"] = False
+        st.session_state["prev_focus_country"] = focus_country
+
+    if n > MAP_DEFAULT_CAP:
+        show_more = st.checkbox(
+            f"Show up to {MAP_HARD_CAP:,} points (may be slow)",
+            value=st.session_state.get("show_more_points", False),
+            key="show_more_points",
+        )
+        if show_more:
+            if n > MAP_HARD_CAP:
+                df_map = df_map.sample(n=MAP_HARD_CAP, random_state=42)
+        else:
+            df_map = df_map.sample(n=MAP_DEFAULT_CAP, random_state=42)
+
+    # Two-layer plot: primary care below, hospitals on top
+    df_map["is_hosp"] = df_map["tp_stbl"].apply(_is_hospital_type)
+    df_phc = df_map[~df_map["is_hosp"]].copy()
+    df_hosp = df_map[df_map["is_hosp"]].copy()
+
+    center_lat = float(df_map["lat"].mean())
+    center_lon = float(df_map["lon"].mean())
+    zoom = 4.0 if focus_country != "All LAC" else 2.3
+
+    # Use plotly scatter_map (MapLibre) instead of deprecated scatter_mapbox
+    # This reduces some mapbox-related baggage and is future-proof.
+    if len(df_phc) == 0:
+        base_df = df_map.copy()
     else:
-        st.info(f"Showing facilities for: **{focus_country}**")
+        base_df = df_phc.copy()
 
-    if fac_focus.empty:
-        st.warning("No facilities match your current filters for the selected focus country.")
-    else:
-        k = compute_kpis_map(fac_focus)
-        a, b, c, d, e = st.columns(5)
-        a.metric("Total facilities", f"{k['total']:,}")
-        b.metric("% with any speed", f"{k['pct_with_speed']:.1f}%")
-        c.metric("% high-speed", f"{k['pct_high_speed']:.1f}%")
-        d.metric("% Primary care", f"{k['pct_phc']:.1f}%")
-        e.metric("% Hospitals", f"{k['pct_hosp']:.1f}%")
+    fig = px.scatter_map(
+        base_df,
+        lat="lat",
+        lon="lon",
+        color_discrete_sequence=[IDB_COLORS["navy"]],
+        hover_name="name",
+        hover_data=hover_data,
+        opacity=0.85,
+        zoom=zoom,
+        center={"lat": center_lat, "lon": center_lon},
+        height=650,
+    )
+    fig.update_traces(marker={"size": 4})
 
-        plot_df = fac_focus.dropna(subset=["lat", "lon"]).copy()
-
-        if len(plot_df) > 30000:
-            st.warning(f"Map has {len(plot_df):,} points. Showing 30,000 for performance.")
-            if not st.checkbox("Show all points (may be slow)", value=False):
-                plot_df = plot_df.sample(n=30000, random_state=42)
-
-        types_present = sorted(plot_df["tp_stbl"].dropna().unique().tolist())
-        hosp_types = [t for t in types_present if _is_hospital_type(t)]
-        non_hosp_types = [t for t in types_present if t not in hosp_types]
-
-        color_map = {}
-        for t in hosp_types:
-            color_map[str(t)] = IDB_COLORS["orange"]
-        for t in non_hosp_types:
-            color_map[str(t)] = IDB_COLORS["navy"]
-
-        j = 0
-        for t in types_present:
-            if str(t) not in color_map:
-                color_map[str(t)] = PLOTLY_DISCRETE[j % len(PLOTLY_DISCRETE)]
-                j += 1
-
-        # Plot primary care first, then hospitals on top (better visibility)
-        df_primary = plot_df[plot_df["tp_stbl"].isin(non_hosp_types)].copy() if non_hosp_types else plot_df.iloc[0:0].copy()
-        df_hosp = plot_df[plot_df["tp_stbl"].isin(hosp_types)].copy() if hosp_types else plot_df.iloc[0:0].copy()
-
-        base_df = df_primary if len(df_primary) else plot_df
-
-        fig = px.scatter_mapbox(
-            base_df,
+    if len(df_hosp) > 0:
+        fig_h = px.scatter_map(
+            df_hosp,
             lat="lat",
             lon="lon",
-            color="tp_stbl",
-            color_discrete_map=color_map,
+            color_discrete_sequence=[IDB_COLORS["orange"]],
             hover_name="name",
-            hover_data=[
-                "country", "tp_stbl",
-                "fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps",
-                "selected_speed_mbps", "high_speed", "speed_source"
-            ],
-            zoom=3.4 if focus_country != "All LAC" else 2.3,
-            height=650,
-            opacity=0.90,
+            hover_data=hover_data,
+            opacity=0.95,
         )
-        fig.update_traces(marker={"size": 4})
+        fig_h.update_traces(marker={"size": 5})
+        for tr in fig_h.data:
+            fig.add_trace(tr)
 
-        if len(df_hosp):
-            fig2 = px.scatter_mapbox(
-                df_hosp,
-                lat="lat",
-                lon="lon",
-                color="tp_stbl",
-                color_discrete_map=color_map,
-                hover_name="name",
-                hover_data=[
-                    "country", "tp_stbl",
-                    "fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps",
-                    "selected_speed_mbps", "high_speed", "speed_source"
-                ],
-                opacity=0.95,
-            )
-            fig2.update_traces(marker={"size": 5})
-            for tr in fig2.data:
-                fig.add_trace(tr)
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        legend=dict(orientation="h"),
+        showlegend=False,
+    )
 
-        fig.update_layout(
-            mapbox_style="open-street-map",
-            margin=dict(l=0, r=0, t=0, b=0),
-            legend_title_text="Facility type"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 # =============================================================================
-# TAB 2: Country Distributions
+# TAB 2: Country Distributions (NO CHOROPLETH to avoid MessageSizeError)
 # =============================================================================
 with tabs[1]:
-    st.subheader("Country distributions (LAC-wide)")
-    st.caption("This tab is LAC-wide (not affected by Country focus). Distributions are sampled for performance.")
+    st.markdown(
+        """
+**What this tab shows**
+- Country-by-country distribution of the **selected speed** (only facilities with speed).
+- Summary table: minimum, P25, median, P75, and % below a user-defined threshold.
 
-    df_speed = fac_global_hs.dropna(subset=["selected_speed_mbps"]).copy()
-    if df_speed.empty:
-        st.warning("No facilities with selected speed under current global filters.")
+**Note**: The optional choropleth was removed because it repeatedly exceeded Streamlit’s message size limit.
+        """
+    )
+
+    threshold = st.number_input("Low-connectivity threshold (Mbps)", min_value=0.0, value=5.0, step=1.0)
+
+    df = fac1[fac1["has_speed"]].copy()
+    if df.empty:
+        st.warning("No facilities with speed available.")
+        st.stop()
+
+    # Lighter plot: sample per country
+    max_per_country = st.slider("Max facilities per country in plot (performance)", 200, 5000, 800, 100)
+    df_plot = df.groupby("country", group_keys=False).apply(
+        lambda g: g.sample(n=min(len(g), max_per_country), random_state=42)
+    )
+
+    chart_type = st.selectbox("Chart type", ["Violin (recommended)", "Box"], index=0)
+
+    if chart_type.startswith("Violin"):
+        fig = px.violin(
+            df_plot,
+            x="country",
+            y="selected_speed_mbps",
+            color_discrete_sequence=[IDB_COLORS["teal"]],
+            box=True,
+            points=False,
+        )
     else:
-        plot_kind = st.radio("Distribution plot", ["Box (sampled)", "Violin (sampled)"], horizontal=True, index=1)
-        sampled = sample_for_distribution(fac_global_hs)
+        fig = px.box(
+            df_plot,
+            x="country",
+            y="selected_speed_mbps",
+            points=False,
+        )
 
-        if plot_kind.startswith("Box"):
-            fig = px.box(sampled, x="country", y="selected_speed_mbps", points=False, height=520)
-        else:
-            fig = px.violin(sampled, x="country", y="selected_speed_mbps", box=True, points=False, height=520)
+    fig.update_layout(
+        xaxis_title="Country",
+        yaxis_title="Selected speed (Mbps)",
+        height=520,
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    st.plotly_chart(fig, width="stretch")
 
-        fig.update_layout(xaxis_title="", yaxis_title="Selected speed (Mbps)", margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-        tbl = country_stats_table(fac_global_hs, threshold=float(country_threshold))
-        st.markdown("**Country summary (selected speed)**")
-        st.dataframe(tbl, use_container_width=True)
+    st.subheader("Country summary table")
+    tbl = pretty_country_table(df, threshold)
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # TAB 3: Regional Gaps
 # =============================================================================
 with tabs[2]:
-    st.subheader("Regional gaps (LAC-wide)")
-    st.caption("Gap = group statistic − LAC reference. Negative = below reference; Positive = above reference.")
-
-    level = st.selectbox("Group level", ["Country", "ADM1", "ADM2"], index=0)
-    ref_stat = st.selectbox("LAC reference", ["Median", "P25"], index=0)
-    group_stat = st.selectbox("Group statistic", ["Median", "P25"], index=0)
-
-    country_filter = None
-    if level in ["ADM1", "ADM2"]:
-        st.markdown("**Optional filter (recommended for ADM1/ADM2):**")
-        country_filter = st.multiselect("Filter to countries", options=sorted(fac_global_hs["country"].dropna().unique().tolist()), default=[])
-
-    gap_tbl, lac_ref = regional_gaps(fac_global_hs, level, ref_stat, group_stat, country_filter=country_filter)
-    st.caption(f"LAC reference ({ref_stat}) = {lac_ref:.2f} Mbps")
-
-    show_only = st.radio("Display", ["All groups", "Only below reference", "Only above reference"], horizontal=True, index=0)
-    n_groups = st.slider("Number of groups to display", 10, 400, 80, step=10)
-
-    plot_tbl = gap_tbl.copy()
-    if show_only == "Only below reference":
-        plot_tbl = plot_tbl[plot_tbl["Gap (Mbps)"] < 0].copy()
-    elif show_only == "Only above reference":
-        plot_tbl = plot_tbl[plot_tbl["Gap (Mbps)"] > 0].copy()
-
-    plot_tbl = plot_tbl.sort_values("Gap (Mbps)").head(n_groups).copy()
-
-    if plot_tbl.empty:
-        st.warning("No groups to plot under current selection.")
-    else:
-        if level == "Country":
-            plot_tbl["Group"] = plot_tbl["country"]
-        elif level == "ADM1":
-            plot_tbl["Group"] = plot_tbl["ADM1_EN"].fillna("Unknown ADM1") + " — " + plot_tbl["country"]
-        else:
-            plot_tbl["Group"] = plot_tbl["ADM2_EN"].fillna("Unknown ADM2") + " — " + plot_tbl["country"]
-
-        fig = px.bar(
-            plot_tbl,
-            x="Gap (Mbps)",
-            y="Group",
-            orientation="h",
-            color="Gap direction",
-            color_discrete_map={
-                "Below reference": IDB_COLORS["orange"],
-                "Above reference": IDB_COLORS["teal"],
-            },
-            height=760,
-        )
-        fig.update_layout(xaxis_title="Gap (Mbps)", yaxis_title="", margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Regional gaps table**")
-    st.dataframe(gap_tbl, use_container_width=True)
-
-# =============================================================================
-# TAB 4: Urban vs Rural
-# =============================================================================
-with tabs[3]:
-    st.subheader("Urban vs rural (LAC-wide)")
-    st.caption("Urban = facility within urban polygons. Rural = outside. Not affected by Country focus.")
-
-    if "is_urban" not in fac_global_hs.columns:
-        st.error("Missing `is_urban` in prepared facilities. Re-run preprocess.py.")
-    else:
-        d = fac_global_hs.dropna(subset=["selected_speed_mbps"]).copy()
-        if d.empty:
-            st.warning("No facilities with speed under current global filters.")
-        else:
-            d["Area"] = np.where(d["is_urban"], "Urban", "Rural")
-            d["Below threshold"] = d["selected_speed_mbps"] < float(country_threshold)
-
-            overall = (
-                d.groupby("Area")
-                 .agg(
-                     **{
-                         "N facilities": ("selected_speed_mbps", "size"),
-                         "Median speed (Mbps)": ("selected_speed_mbps", "median"),
-                         "P25 speed (Mbps)": ("selected_speed_mbps", lambda x: x.quantile(0.25)),
-                         "P75 speed (Mbps)": ("selected_speed_mbps", lambda x: x.quantile(0.75)),
-                         "% below threshold": ("Below threshold", lambda x: 100 * x.mean()),
-                         "% high-speed": ("high_speed", lambda x: 100 * x.mean()),
-                     }
-                 )
-                 .reset_index()
-            )
-
-            st.markdown("### Overall: Urban vs Rural")
-            st.dataframe(overall, use_container_width=True)
-
-            fig = px.box(d, x="Area", y="selected_speed_mbps", points=False, height=420)
-            fig.update_layout(xaxis_title="", yaxis_title="Selected speed (Mbps)", margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("### By country: % below threshold (Urban vs Rural)")
-            by_country = (
-                d.groupby(["country", "Area"])
-                 .agg(
-                     **{
-                         "N facilities": ("selected_speed_mbps", "size"),
-                         "Median speed (Mbps)": ("selected_speed_mbps", "median"),
-                         "% below threshold": ("Below threshold", lambda x: 100 * x.mean()),
-                     }
-                 )
-                 .reset_index()
-                 .rename(columns={"country": "Country"})
-            )
-
-            st.dataframe(by_country.sort_values(["% below threshold"], ascending=False), use_container_width=True)
-
-            fig2 = px.bar(by_country, x="Country", y="% below threshold", color="Area", barmode="group", height=480)
-            fig2.update_layout(xaxis_title="", yaxis_title=f"% below {country_threshold} Mbps", margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig2, use_container_width=True)
-
-# =============================================================================
-# TAB 5: Population Coverage  (ALWAYS SAMPLE SMALL BY DEFAULT)
-# =============================================================================
-with tabs[4]:
-    st.subheader("Population coverage (focus country)")
     st.markdown(
         """
-**Objective**: estimate how much population falls within a catchment radius of the selected facilities.
-- We buffer facilities by a radius (km), union the buffers, then count/sum population points inside.
-- If a population weight column exists, we sum it. Otherwise we count points (proxy).
+**What this tab shows**
+Connectivity gaps relative to a LAC reference statistic:
+- Choose the group level: **Country / ADM1 / ADM2**
+- Choose the reference: **LAC median** or **LAC P25**
+- Gap = (group statistic) − (LAC reference)
+Negative gaps are **below** the reference; positive gaps are **above**.
+        """
+    )
+
+    group_level = st.selectbox("Group level", ["Country", "ADM1", "ADM2"], index=0)  # default Country
+    ref_kind = st.selectbox("LAC reference", ["Median", "P25"], index=0)
+    top_n = st.slider("Show top N (by absolute gap)", 5, 50, 20, 5)
+
+    df = fac1[fac1["has_speed"]].copy()
+    if df.empty:
+        st.warning("No facilities with speed available.")
+        st.stop()
+
+    ref_val = df["selected_speed_mbps"].median() if ref_kind == "Median" else df["selected_speed_mbps"].quantile(0.25)
+
+    if group_level == "Country":
+        key_cols = ["country"]
+        label_col = "country"
+    elif group_level == "ADM1":
+        key_cols = ["country", "ADM1_EN"]
+        label_col = "ADM1_EN"
+    else:
+        key_cols = ["country", "ADM2_EN"]
+        label_col = "ADM2_EN"
+
+    agg = df.groupby(key_cols)["selected_speed_mbps"].median().reset_index().rename(columns={"selected_speed_mbps": "Group median (Mbps)"})
+    agg["LAC reference (Mbps)"] = ref_val
+    agg["Gap (Mbps)"] = agg["Group median (Mbps)"] - ref_val
+
+    # pick top by absolute gap
+    agg["abs_gap"] = agg["Gap (Mbps)"].abs()
+    view = agg.sort_values("abs_gap", ascending=False).head(top_n).copy()
+
+    # build label
+    if group_level == "Country":
+        view["Group"] = view["country"]
+    else:
+        view["Group"] = view["country"].astype(str) + " — " + view[label_col].astype(str)
+
+    # plot with two colors
+    view["Direction"] = np.where(view["Gap (Mbps)"] >= 0, "Above reference", "Below reference")
+
+    fig = px.bar(
+        view.sort_values("Gap (Mbps)"),
+        x="Gap (Mbps)",
+        y="Group",
+        color="Direction",
+        color_discrete_map={
+            "Above reference": IDB_COLORS["green"],
+            "Below reference": IDB_COLORS["red"],
+        },
+        orientation="h",
+        height=520,
+    )
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, width="stretch")
+
+    st.dataframe(
+        view.drop(columns=["abs_gap"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# =============================================================================
+# TAB 4: Urban vs Rural (include country stats)
+# =============================================================================
+with tabs[3]:
+    st.markdown(
+        """
+**What this tab shows**
+Connectivity comparison for **urban vs rural facilities** (based on whether the facility point falls within the urban polygons).
+We show:
+- Overall urban vs rural summary
+- Country-level urban vs rural medians and % below threshold
+        """
+    )
+
+    threshold_ur = st.number_input("Below-threshold cutoff (Mbps) for this tab", min_value=0.0, value=5.0, step=1.0)
+
+    df = fac1[fac1["has_speed"]].copy()
+    if df.empty:
+        st.warning("No facilities with speed available.")
+        st.stop()
+
+    if "is_urban" not in df.columns:
+        st.error("facilities_prepared.geoparquet is missing `is_urban` (should be created in preprocess.py).")
+        st.stop()
+
+    df["Area"] = np.where(df["is_urban"], "Urban", "Rural")
+    df["below"] = df["selected_speed_mbps"] < threshold_ur
+
+    # Overall KPIs
+    overall = df.groupby("Area")["selected_speed_mbps"].agg(
+        Facilities="count",
+        Median="median",
+    ).reset_index()
+    overall["% below threshold"] = df.groupby("Area")["below"].mean().values * 100.0
+    overall["Median"] = overall["Median"].round(2)
+    overall["% below threshold"] = overall["% below threshold"].round(1)
+
+    st.subheader("Overall urban vs rural")
+    st.dataframe(overall, use_container_width=True, hide_index=True)
+
+    fig = px.box(
+        df.sample(n=min(len(df), 20_000), random_state=42),
+        x="Area",
+        y="selected_speed_mbps",
+        points=False,
+        color="Area",
+        color_discrete_map={"Urban": IDB_COLORS["teal"], "Rural": IDB_COLORS["gray"]},
+        height=420,
+    )
+    fig.update_layout(xaxis_title="", yaxis_title="Selected speed (Mbps)")
+    st.plotly_chart(fig, width="stretch")
+
+    # Country stats
+    st.subheader("Country-level urban vs rural summary")
+    ctab = (
+        df.groupby(["country", "Area"])
+        .agg(
+            Facilities=("selected_speed_mbps", "count"),
+            Median=("selected_speed_mbps", "median"),
+            P25=("selected_speed_mbps", lambda x: x.quantile(0.25)),
+            P75=("selected_speed_mbps", lambda x: x.quantile(0.75)),
+            Pct_below=("below", "mean"),
+        )
+        .reset_index()
+    )
+    ctab["Median"] = ctab["Median"].round(2)
+    ctab["P25"] = ctab["P25"].round(2)
+    ctab["P75"] = ctab["P75"].round(2)
+    ctab["Pct_below"] = (ctab["Pct_below"] * 100.0).round(1)
+
+    ctab = ctab.rename(columns={
+        "country": "Country",
+        "Area": "Area",
+        "Facilities": "Facilities (with speed)",
+        "Median": "Median (Mbps)",
+        "P25": "P25 (Mbps)",
+        "P75": "P75 (Mbps)",
+        "Pct_below": f"% below {threshold_ur:.1f} Mbps",
+    })
+
+    st.dataframe(ctab, use_container_width=True, hide_index=True)
+
+# =============================================================================
+# TAB 5: Population Coverage (focus country only, robust + sampled)
+# =============================================================================
+with tabs[4]:
+    st.subheader("Population coverage")
+    st.markdown(
+        """
+**Objective**: estimate how much population falls within a catchment radius of facilities.
+- We buffer facilities by a radius (km), then count/sum population points inside.
+- This is an **approximation** based on point population data.
+
+**Important**: This tab uses the **Focus country** selector in the sidebar.
         """
     )
 
     if focus_country == "All LAC":
-        st.warning("For performance, Population Coverage requires selecting a single focus country.")
+        st.warning("For performance, please select a single Focus country to compute population coverage.")
         st.stop()
 
-    pop_gdf = load_population_points()
+    # Filter facilities + population to focus country
+    fac_cov = fac1[fac1["country"] == focus_country].copy()
+    fac_cov = fac_cov[fac_cov["has_speed"]].copy()
 
-    pop_weight_col = meta.get("population_weight_col", None)
+    if fac_cov.empty:
+        st.warning("No facilities with speed for the selected country. Coverage cannot be computed.")
+        st.stop()
+
     if "country" not in pop_gdf.columns:
-        st.error("population_points.geoparquet is missing `country`. Re-run preprocess.py.")
+        st.error("population_points.geoparquet must include `country` (precomputed or joined in preprocessing).")
         st.stop()
 
-    radius_km = st.slider("Catchment radius (km)", min_value=1, max_value=100, value=10, step=1)
-    cov_fac_mode = st.radio("Facilities used for buffers", ["All filtered facilities", "High-speed only"], horizontal=True)
-    high_speed_only = (cov_fac_mode == "High-speed only")
+    pop_cov = pop_gdf[pop_gdf["country"] == focus_country].copy()
 
-    fac_for_cov = fac_focus.copy()
-    if high_speed_only:
-        fac_for_cov = fac_for_cov[fac_for_cov["high_speed"]].copy()
-
-    pop_for_cov_full = pop_gdf[pop_gdf["country"] == focus_country].copy()
-    if pop_for_cov_full.empty:
+    if pop_cov.empty:
         st.warning("No population points found for the selected country.")
         st.stop()
 
-    # Always sample for stability (default small)
-    st.markdown("### Performance settings (recommended to keep defaults)")
-    ALWAYS_SAMPLE = st.checkbox("Use sampling (recommended)", value=True)
-    DEFAULT_SAMPLE = 250_000
-    HARD_CAP = 600_000  # keep it safe for Streamlit Cloud
+    # detect weight col from metadata
+    pop_weight_col = meta.get("population_weight_col", None)
+    has_weight = pop_weight_col is not None and pop_weight_col in pop_cov.columns
 
-    if ALWAYS_SAMPLE:
-        sample_n = st.slider("Population sample size", 50_000, HARD_CAP, min(DEFAULT_SAMPLE, len(pop_for_cov_full)), step=50_000)
-        pop_for_cov = pop_for_cov_full.sample(n=min(sample_n, len(pop_for_cov_full)), random_state=42).copy()
-        st.caption(f"Using a random sample of {len(pop_for_cov):,} population points (out of {len(pop_for_cov_full):,}).")
-    else:
-        # still enforce hard cap
-        if len(pop_for_cov_full) > HARD_CAP:
-            st.warning(f"Too many population points ({len(pop_for_cov_full):,}). Sampling is required on Streamlit Cloud.")
-            pop_for_cov = pop_for_cov_full.sample(n=HARD_CAP, random_state=42).copy()
-        else:
-            pop_for_cov = pop_for_cov_full
+    radius_km = st.slider("Catchment radius (km)", 1, 50, 10, 1)
 
-    payload = {
-        "focus_country": focus_country,
-        "types": sorted(sel_types),
-        "require_speed": require_speed,
-        "high_speed_only": high_speed_only,
+    # sample pop points (hard) to prevent crashes
+    if len(pop_cov) > POP_DEFAULT_CAP:
+        st.info(f"Population points: {len(pop_cov):,}. Using a sample of {POP_DEFAULT_CAP:,} for stability.")
+        pop_cov = pop_cov.sample(n=POP_DEFAULT_CAP, random_state=42)
+
+    # sample facilities used for buffers
+    if len(fac_cov) > FAC_BUFFER_CAP:
+        st.info(f"Facilities: {len(fac_cov):,}. Using a sample of {FAC_BUFFER_CAP:,} for buffering to keep the app stable.")
+        fac_cov = fac_cov.sample(n=FAC_BUFFER_CAP, random_state=42)
+
+    # caching key
+    cov_key = _hash_filters({
+        "country": focus_country,
+        "radius_km": radius_km,
         "direction": direction,
-        "network_mode": network_mode,
-        "radius_km": float(radius_km),
-        "pop_points_used": int(len(pop_for_cov)),
+        "mode": network_mode,
         "hs_mode": hs_mode,
-        "quantile_spec": quantile_spec,
-        "threshold": float(country_threshold),
-    }
-    filter_hash = _stable_hash(payload)
+        "type_filter": type_filter,
+        "only_high_speed": only_high_speed,
+    })
 
-    with st.spinner("Computing coverage..."):
-        overall, cov_tbl = population_coverage_cached(
-            filter_hash=filter_hash,
-            lac_crs_str=LAC_CRS,
-            radius_km=float(radius_km),
-            pop_weight_col=pop_weight_col,
-            _fac_gdf=fac_for_cov[["geometry"]].copy(),
-            _pop_gdf=pop_for_cov[["geometry", "country"] + ([pop_weight_col] if pop_weight_col and pop_weight_col in pop_for_cov.columns else [])].copy(),
+    @st.cache_data(show_spinner=False)
+    def compute_coverage_cached(_key: str) -> dict:
+        # Rebuild small GDFs inside cache to avoid hashing GeoDataFrames
+        f = fac1[fac1["country"] == focus_country].copy()
+        f = f[f["has_speed"]].copy()
+        f = f[["geometry", "country"]].dropna(subset=["geometry"]).copy()
+
+        # same sampling as above, deterministic
+        if len(f) > FAC_BUFFER_CAP:
+            f = f.sample(n=FAC_BUFFER_CAP, random_state=42)
+
+        p = pop_gdf[pop_gdf["country"] == focus_country].copy()
+        p = p[["geometry", "country"] + ([pop_weight_col] if (pop_weight_col and pop_weight_col in pop_gdf.columns) else [])]
+        p = p.dropna(subset=["geometry"]).copy()
+        if len(p) > POP_DEFAULT_CAP:
+            p = p.sample(n=POP_DEFAULT_CAP, random_state=42)
+
+        # Use EPSG:3857 for buffering (meters)
+        f_m = f.to_crs(3857)
+        buffers = f_m.geometry.buffer(radius_km * 1000.0)
+
+        # Chunked union (prevents memory spike)
+        union_poly = chunked_union(list(buffers), chunk_size=250)
+        if union_poly is None or union_poly.is_empty:
+            return {"covered_points": 0, "total_points": len(p), "covered_pop": None, "total_pop": None}
+
+        # Convert union back to pop CRS for containment test
+        union_gdf = gpd.GeoDataFrame(geometry=[union_poly], crs=3857).to_crs(p.crs)
+
+        # Bounding-box prefilter (fast)
+        minx, miny, maxx, maxy = union_gdf.total_bounds
+        p_bb = p.cx[minx:maxx, miny:maxy].copy()
+        if p_bb.empty:
+            return {"covered_points": 0, "total_points": len(p), "covered_pop": None, "total_pop": None}
+
+        # Exact within
+        covered_mask = p_bb.within(union_gdf.geometry.iloc[0])
+        covered_points = int(covered_mask.sum())
+        total_points = int(len(p))
+
+        if pop_weight_col and pop_weight_col in p.columns:
+            total_pop = float(pd.to_numeric(p[pop_weight_col], errors="coerce").fillna(0).sum())
+            covered_pop = float(pd.to_numeric(p_bb.loc[covered_mask, pop_weight_col], errors="coerce").fillna(0).sum())
+            return {
+                "covered_points": covered_points,
+                "total_points": total_points,
+                "covered_pop": covered_pop,
+                "total_pop": total_pop,
+            }
+
+        return {
+            "covered_points": covered_points,
+            "total_points": total_points,
+            "covered_pop": None,
+            "total_pop": None,
+        }
+
+    res = compute_coverage_cached(cov_key)
+
+    # Output KPIs + pie
+    if has_weight and res["total_pop"] and res["total_pop"] > 0:
+        covered = res["covered_pop"]
+        total = res["total_pop"]
+        pct = 100.0 * covered / total if total > 0 else 0.0
+
+        a, b, c = st.columns(3)
+        a.metric("Estimated covered population", f"{covered:,.0f}")
+        b.metric("Estimated total population (sample-based)", f"{total:,.0f}")
+        c.metric("% covered (approx.)", f"{pct:.1f}%")
+
+        fig = go.Figure(
+            data=[go.Pie(
+                labels=["Covered", "Not covered"],
+                values=[covered, max(total - covered, 0)],
+                hole=0.45,
+            )]
         )
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, width="stretch")
 
-    a, b, c = st.columns(3)
-    if str(overall.get("metric", "")).startswith("sum"):
-        a.metric("Covered population (sample)", f"{overall.get('covered', 0):,.0f}")
-        b.metric("Total population (sample)", f"{overall.get('total', 0):,.0f}")
+        st.caption("Interpretation: approximation based on population point weights and sampled points for performance.")
     else:
-        a.metric("Covered population points (sample)", f"{overall.get('covered', 0):,}")
-        b.metric("Total population points (sample)", f"{overall.get('total', 0):,}")
-    c.metric("% covered (sample)", f"{overall.get('pct_covered', 0.0):.1f}%")
+        covered = res["covered_points"]
+        total = res["total_points"]
+        pct = 100.0 * covered / total if total > 0 else 0.0
 
-    covered = float(overall.get("covered", 0))
-    total = float(overall.get("total", 0))
-    not_cov = max(total - covered, 0)
+        a, b, c = st.columns(3)
+        a.metric("Covered population points", f"{covered:,}")
+        b.metric("Total population points (sample)", f"{total:,}")
+        c.metric("% points covered (proxy)", f"{pct:.1f}%")
 
-    pie_df = pd.DataFrame({"Status": ["Covered", "Not covered"], "Value": [covered, not_cov]})
-    pie_fig = px.pie(
-        pie_df,
-        names="Status",
-        values="Value",
-        title="Coverage in sample: covered vs not covered",
-        color_discrete_sequence=[IDB_COLORS["teal"], IDB_COLORS["gray"]],
-    )
-    st.plotly_chart(pie_fig, use_container_width=True)
+        fig = go.Figure(
+            data=[go.Pie(
+                labels=["Covered points", "Not covered points"],
+                values=[covered, max(total - covered, 0)],
+                hole=0.45,
+            )]
+        )
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig, width="stretch")
 
-    st.markdown("### Note on interpretation")
-    st.caption(
-        "Coverage is computed using a sampled set of population points to keep the app stable. "
-        "Use it as an indicative signal for relative comparisons (e.g., different radii or facility subsets)."
-    )
-
-st.caption("")
+        st.warning(
+            "No population weight column was detected. Results show **# population points covered** (proxy), not people."
+        )
