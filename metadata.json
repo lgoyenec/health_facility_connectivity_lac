@@ -1,0 +1,37 @@
+{
+  "crs": "EPSG:4326",
+  "facilities_count": 123163,
+  "countries_count": 26,
+  "population_points_count": 97610444,
+  "facility_types": [
+    "Centro de Atenci\u00f3n Primaria",
+    "Hospital"
+  ],
+  "countries_list": [
+    "Argentina",
+    "Bahamas",
+    "Belize",
+    "Bolivia",
+    "Brazil",
+    "Chile",
+    "Colombia",
+    "Costa Rica",
+    "Cuba",
+    "Dominican Republic",
+    "Ecuador",
+    "El Salvador",
+    "Guatemala",
+    "Guyana",
+    "Haiti",
+    "Honduras",
+    "Jamaica",
+    "Mexico",
+    "Nicaragua",
+    "Panama",
+    "Paraguay",
+    "Per\u00fa",
+    "Trinidad and Tobago",
+    "Uruguay"
+  ],
+  "population_weight_col": "population"
+}
