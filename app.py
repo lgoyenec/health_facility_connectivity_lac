@@ -76,9 +76,6 @@ PLOTLY_DISCRETE = [
 # TRUE POP-UP disclaimer (requires st.dialog)
 # =============================================================================
 def show_modal_disclaimer_once():
-    """
-    True pop-up disclaimer. Leaves no content behind after user accepts.
-    """
     if "disclaimer_dismissed" not in st.session_state:
         st.session_state["disclaimer_dismissed"] = False
 
@@ -87,7 +84,7 @@ def show_modal_disclaimer_once():
 
     if not hasattr(st, "dialog"):
         st.error(
-            "This app is configured to show a true pop-up disclaimer using `st.dialog()`, "
+            "This app shows a true pop-up disclaimer using `st.dialog()`, "
             "but your Streamlit version does not support it.\n\n"
             "Upgrade Streamlit:\n  pip install -U streamlit\n\n"
             "Then restart the app."
@@ -122,10 +119,6 @@ show_modal_disclaimer_once()
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def load_facilities_countries_metadata() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, Dict]:
-    """
-    Load only the smaller / critical datasets at startup.
-    Population points are loaded lazily inside Tab 5.
-    """
     try:
         fac = gpd.read_parquet("./facilities_prepared.geoparquet")
         countries = gpd.read_parquet("./countries.geoparquet")
@@ -142,7 +135,6 @@ def load_facilities_countries_metadata() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataF
         )
         st.stop()
 
-    # Numeric coercions
     for c in SPEED_COLS:
         if c in fac.columns:
             fac[c] = pd.to_numeric(fac[c], errors="coerce")
@@ -155,10 +147,6 @@ def load_facilities_countries_metadata() -> Tuple[gpd.GeoDataFrame, gpd.GeoDataF
 
 @st.cache_resource(show_spinner=False)
 def load_population_points() -> gpd.GeoDataFrame:
-    """
-    Load population points only when needed (Tab 5).
-    This is usually the largest file and can crash Streamlit Cloud if loaded at startup.
-    """
     try:
         pop = gpd.read_parquet("./population_points.geoparquet")
     except Exception as e:
@@ -174,7 +162,6 @@ def load_population_points() -> gpd.GeoDataFrame:
 
 fac0, countries_gdf, meta = load_facilities_countries_metadata()
 LAC_CRS = meta.get("crs", str(getattr(fac0, "crs", "")))
-POLY_KEY = "country" if "country" in countries_gdf.columns else None
 
 # =============================================================================
 # Dashboard usage instructions
@@ -197,7 +184,8 @@ with st.expander("How to use this dashboard", expanded=False):
 - **Manual** = you set a cutoff per facility type
 
 **C) Country focus**
-- This selector affects **only**:
+- To keep performance stable, the country focus is **single-country only** (or **All LAC**).
+- It affects **only**:
   - *Facilities Map*
   - *Population Coverage*
 - Other tabs remain **LAC-wide** (because they already summarize across all countries).
@@ -372,24 +360,28 @@ def regional_gaps(_df: pd.DataFrame, level: str, ref_stat: str, group_stat: str,
     return agg.sort_values("Gap (Mbps)"), lac_ref
 
 
+# =============================================================================
+# Population coverage — avoid huge serialization + always sample by default
+# =============================================================================
 @st.cache_data(show_spinner=True)
 def population_coverage_cached(
+    filter_hash: str,
     lac_crs_str: str,
     radius_km: float,
-    filter_hash: str,
     pop_weight_col: Optional[str],
-    fac_geojson: bytes,
-    pop_geojson: bytes,
+    _fac_gdf: gpd.GeoDataFrame,
+    _pop_gdf: gpd.GeoDataFrame,
 ) -> Tuple[Dict, pd.DataFrame]:
-    fac = gpd.GeoDataFrame.from_features(json.loads(fac_geojson.decode("utf-8")), crs=lac_crs_str)
-    pop = gpd.GeoDataFrame.from_features(json.loads(pop_geojson.decode("utf-8")), crs=lac_crs_str)
-
+    """
+    Cached by filter_hash (not by GeoDataFrames), while GeoDataFrames are passed
+    as underscore args (unhashed) to avoid Streamlit hashing errors and huge payloads.
+    """
     # Buffer in metric CRS
     c = CRS.from_user_input(lac_crs_str)
     metric_crs = c if (c and not c.is_geographic) else CRS.from_epsg(3857)
 
-    fac_m = fac.to_crs(metric_crs)
-    pop_m = pop.to_crs(metric_crs)
+    fac_m = _fac_gdf.to_crs(metric_crs)
+    pop_m = _pop_gdf.to_crs(metric_crs)
 
     radius_m = float(radius_km) * 1000.0
     union_poly = unary_union(list(fac_m.geometry.buffer(radius_m).values))
@@ -455,30 +447,11 @@ with st.sidebar:
 
     st.divider()
     st.header("Country focus")
-    st.markdown('<div class="sidebar-note">Only applies to <i>Facilities Map</i> and <i>Population Coverage</i>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-note">Single-country only (or All LAC). Applies to <i>Facilities Map</i> and <i>Population Coverage</i>.</div>', unsafe_allow_html=True)
 
     all_countries = sorted(fac0["country"].dropna().unique().tolist())
-
-    if "focus_countries" not in st.session_state:
-        st.session_state["focus_countries"] = []
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Select all", use_container_width=True):
-            st.session_state["focus_countries"] = all_countries
-            st.rerun()
-    with c2:
-        if st.button("Clear", use_container_width=True):
-            st.session_state["focus_countries"] = []
-            st.rerun()
-
-    focus_countries = st.multiselect(
-        "Choose countries (type to search)",
-        options=all_countries,
-        key="focus_countries",
-    )
-    st.caption(f"Selected: **{len(focus_countries)}**")
-
+    focus_option = ["All LAC"] + all_countries
+    focus_country = st.selectbox("Focus country", options=focus_option, index=0)
 
 # =============================================================================
 # Compute global derived data
@@ -489,8 +462,8 @@ fac_global_hs, _ = compute_high_speed_flag_country_type(fac_global, hs_mode, qua
 
 # Focus subset for Map + Population Coverage only
 fac_focus = fac_global_hs.copy()
-if focus_countries:
-    fac_focus = fac_focus[fac_focus["country"].isin(focus_countries)].copy()
+if focus_country != "All LAC":
+    fac_focus = fac_focus[fac_focus["country"] == focus_country].copy()
 
 tabs = st.tabs([
     "Facilities Map",
@@ -504,16 +477,16 @@ tabs = st.tabs([
 # TAB 1: Facilities Map
 # =============================================================================
 with tabs[0]:
-    st.subheader("Facilities map (focus countries)")
+    st.subheader("Facilities map (focus country)")
     st.caption("Country focus affects only this tab and Population Coverage.")
 
-    if focus_countries:
-        st.info(f"Showing facilities for: {', '.join(focus_countries[:8])}{'...' if len(focus_countries) > 8 else ''}")
+    if focus_country == "All LAC":
+        st.warning("Focus country = All LAC. The map can be heavy; the app will downsample automatically if needed.")
     else:
-        st.warning("No focus countries selected — showing ALL LAC facilities on the map (may be heavy).")
+        st.info(f"Showing facilities for: **{focus_country}**")
 
     if fac_focus.empty:
-        st.warning("No facilities match your current filters for the selected focus countries.")
+        st.warning("No facilities match your current filters for the selected focus country.")
     else:
         k = compute_kpis_map(fac_focus)
         a, b, c, d, e = st.columns(5)
@@ -539,12 +512,14 @@ with tabs[0]:
             color_map[str(t)] = IDB_COLORS["orange"]
         for t in non_hosp_types:
             color_map[str(t)] = IDB_COLORS["navy"]
+
         j = 0
         for t in types_present:
             if str(t) not in color_map:
                 color_map[str(t)] = PLOTLY_DISCRETE[j % len(PLOTLY_DISCRETE)]
                 j += 1
 
+        # Plot primary care first, then hospitals on top (better visibility)
         df_primary = plot_df[plot_df["tp_stbl"].isin(non_hosp_types)].copy() if non_hosp_types else plot_df.iloc[0:0].copy()
         df_hosp = plot_df[plot_df["tp_stbl"].isin(hosp_types)].copy() if hosp_types else plot_df.iloc[0:0].copy()
 
@@ -562,7 +537,7 @@ with tabs[0]:
                 "fix_dl_mbps", "fix_ul_mbps", "mob_dl_mbps", "mob_ul_mbps",
                 "selected_speed_mbps", "high_speed", "speed_source"
             ],
-            zoom=2.3,
+            zoom=3.4 if focus_country != "All LAC" else 2.3,
             height=650,
             opacity=0.90,
         )
@@ -738,10 +713,10 @@ with tabs[3]:
             st.plotly_chart(fig2, use_container_width=True)
 
 # =============================================================================
-# TAB 5: Population Coverage  (LAZY LOAD)
+# TAB 5: Population Coverage  (ALWAYS SAMPLE SMALL BY DEFAULT)
 # =============================================================================
 with tabs[4]:
-    st.subheader("Population coverage (focus countries)")
+    st.subheader("Population coverage (focus country)")
     st.markdown(
         """
 **Objective**: estimate how much population falls within a catchment radius of the selected facilities.
@@ -750,11 +725,10 @@ with tabs[4]:
         """
     )
 
-    if not focus_countries:
-        st.warning("Select 1+ focus countries in the sidebar to compute coverage.")
+    if focus_country == "All LAC":
+        st.warning("For performance, Population Coverage requires selecting a single focus country.")
         st.stop()
 
-    # Lazy load here (prevents crash right after disclaimer)
     pop_gdf = load_population_points()
 
     pop_weight_col = meta.get("population_weight_col", None)
@@ -770,24 +744,31 @@ with tabs[4]:
     if high_speed_only:
         fac_for_cov = fac_for_cov[fac_for_cov["high_speed"]].copy()
 
-    pop_for_cov_full = pop_gdf[pop_gdf["country"].isin(focus_countries)].copy()
+    pop_for_cov_full = pop_gdf[pop_gdf["country"] == focus_country].copy()
+    if pop_for_cov_full.empty:
+        st.warning("No population points found for the selected country.")
+        st.stop()
 
-    MAX_POP_POINTS = 1_200_000  # tighter limit for cloud safety
-    approximate = False
-    sample_n = None
+    # Always sample for stability (default small)
+    st.markdown("### Performance settings (recommended to keep defaults)")
+    ALWAYS_SAMPLE = st.checkbox("Use sampling (recommended)", value=True)
+    DEFAULT_SAMPLE = 250_000
+    HARD_CAP = 600_000  # keep it safe for Streamlit Cloud
 
-    if len(pop_for_cov_full) > MAX_POP_POINTS:
-        st.warning(f"Population points are very large for selected focus countries ({len(pop_for_cov_full):,}). Sampling is required on Streamlit Cloud.")
-        approximate = True
-        sample_n = st.slider("Sample size (population points)", 200_000, MAX_POP_POINTS, 800_000, step=100_000)
-
-    if approximate and sample_n is not None:
+    if ALWAYS_SAMPLE:
+        sample_n = st.slider("Population sample size", 50_000, HARD_CAP, min(DEFAULT_SAMPLE, len(pop_for_cov_full)), step=50_000)
         pop_for_cov = pop_for_cov_full.sample(n=min(sample_n, len(pop_for_cov_full)), random_state=42).copy()
+        st.caption(f"Using a random sample of {len(pop_for_cov):,} population points (out of {len(pop_for_cov_full):,}).")
     else:
-        pop_for_cov = pop_for_cov_full
+        # still enforce hard cap
+        if len(pop_for_cov_full) > HARD_CAP:
+            st.warning(f"Too many population points ({len(pop_for_cov_full):,}). Sampling is required on Streamlit Cloud.")
+            pop_for_cov = pop_for_cov_full.sample(n=HARD_CAP, random_state=42).copy()
+        else:
+            pop_for_cov = pop_for_cov_full
 
     payload = {
-        "focus_countries": sorted(focus_countries),
+        "focus_country": focus_country,
         "types": sorted(sel_types),
         "require_speed": require_speed,
         "high_speed_only": high_speed_only,
@@ -795,34 +776,30 @@ with tabs[4]:
         "network_mode": network_mode,
         "radius_km": float(radius_km),
         "pop_points_used": int(len(pop_for_cov)),
+        "hs_mode": hs_mode,
+        "quantile_spec": quantile_spec,
+        "threshold": float(country_threshold),
     }
     filter_hash = _stable_hash(payload)
 
-    fac_geojson = json.dumps(fac_for_cov[["geometry"]].__geo_interface__).encode("utf-8")
-
-    pop_cols = ["geometry", "country"]
-    if pop_weight_col and pop_weight_col in pop_for_cov.columns:
-        pop_cols.append(pop_weight_col)
-    pop_geojson = json.dumps(pop_for_cov[pop_cols].__geo_interface__).encode("utf-8")
-
     with st.spinner("Computing coverage..."):
         overall, cov_tbl = population_coverage_cached(
+            filter_hash=filter_hash,
             lac_crs_str=LAC_CRS,
             radius_km=float(radius_km),
-            filter_hash=filter_hash,
             pop_weight_col=pop_weight_col,
-            fac_geojson=fac_geojson,
-            pop_geojson=pop_geojson,
+            _fac_gdf=fac_for_cov[["geometry"]].copy(),
+            _pop_gdf=pop_for_cov[["geometry", "country"] + ([pop_weight_col] if pop_weight_col and pop_weight_col in pop_for_cov.columns else [])].copy(),
         )
 
     a, b, c = st.columns(3)
     if str(overall.get("metric", "")).startswith("sum"):
-        a.metric("Covered population", f"{overall.get('covered', 0):,.0f}")
-        b.metric("Total population (focus countries)", f"{overall.get('total', 0):,.0f}")
+        a.metric("Covered population (sample)", f"{overall.get('covered', 0):,.0f}")
+        b.metric("Total population (sample)", f"{overall.get('total', 0):,.0f}")
     else:
-        a.metric("Covered population points", f"{overall.get('covered', 0):,}")
-        b.metric("Total population points (focus countries)", f"{overall.get('total', 0):,}")
-    c.metric("% covered", f"{overall.get('pct_covered', 0.0):.1f}%")
+        a.metric("Covered population points (sample)", f"{overall.get('covered', 0):,}")
+        b.metric("Total population points (sample)", f"{overall.get('total', 0):,}")
+    c.metric("% covered (sample)", f"{overall.get('pct_covered', 0.0):.1f}%")
 
     covered = float(overall.get("covered", 0))
     total = float(overall.get("total", 0))
@@ -833,13 +810,15 @@ with tabs[4]:
         pie_df,
         names="Status",
         values="Value",
-        title="Overall coverage: covered vs not covered",
+        title="Coverage in sample: covered vs not covered",
         color_discrete_sequence=[IDB_COLORS["teal"], IDB_COLORS["gray"]],
     )
     st.plotly_chart(pie_fig, use_container_width=True)
 
-    if cov_tbl is not None and not cov_tbl.empty:
-        st.markdown("### Coverage by country (focus countries)")
-        st.dataframe(cov_tbl, use_container_width=True)
+    st.markdown("### Note on interpretation")
+    st.caption(
+        "Coverage is computed using a sampled set of population points to keep the app stable. "
+        "Use it as an indicative signal for relative comparisons (e.g., different radii or facility subsets)."
+    )
 
 st.caption("")
