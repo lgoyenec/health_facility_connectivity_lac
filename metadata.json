@@ -33,5 +33,13 @@
     "Trinidad and Tobago",
     "Uruguay"
   ],
-  "population_weight_col": "population"
+  "population_weight_col": "population",
+  "precomputed_coverage_file": "population_coverage_by_country.parquet",
+  "precomputed_coverage_radii_km": [
+    5,
+    10,
+    15,
+    25,
+    50
+  ]
 }

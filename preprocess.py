@@ -9,6 +9,7 @@ Outputs (in same folder):
   ./facilities_prepared.geoparquet
   ./countries.geoparquet
   ./population_points.geoparquet
+  ./population_coverage_by_country.parquet
   ./metadata.json
 """
 
@@ -25,6 +26,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 OUT_FAC = Path("./facilities_prepared.geoparquet")
 OUT_COU = Path("./countries.geoparquet")
 OUT_POP = Path("./population_points.geoparquet")
+OUT_COV = Path("./population_coverage_by_country.parquet")
 OUT_META = Path("./metadata.json")
 
 # ---------------------------------------------------------------------------
@@ -120,7 +122,7 @@ def detect_population_weight_column(df: pd.DataFrame) -> str | None:
     for cand in candidates:
         if cand in cols_l:
             return cols_l[cand]
-    # fallback: any numeric column that looks like pop
+    # fallback: any column that looks like pop
     for c in df.columns:
         cl = c.lower()
         if "pop" in cl or "pob" in cl:
@@ -206,14 +208,20 @@ def main():
     # 3) Population points
     # -----------------------
     pop_df = poplac.copy()
-    if not {"latitude", "longitude"}.issubset(pop_df.columns):
-        raise ValueError("poplac must have lat/lon columns per requirements.")
+
+    # poplac must have lat/lon (preferred) or latitude/longitude (fallback)
+    if {"lat", "lon"}.issubset(pop_df.columns):
+        _lat_col, _lon_col = "lat", "lon"
+    elif {"latitude", "longitude"}.issubset(pop_df.columns):
+        _lat_col, _lon_col = "latitude", "longitude"  # STRICTLY NECESSARY EDIT
+    else:
+        raise ValueError("poplac must have `lat` and `lon` columns (or `latitude`/`longitude` as fallback).")
 
     pop_weight_col = detect_population_weight_column(pop_df)
 
     pop_gdf = gpd.GeoDataFrame(
         pop_df,
-        geometry=gpd.points_from_xy(pop_df["longitude"], pop_df["latitude"]),
+        geometry=gpd.points_from_xy(pop_df[_lon_col], pop_df[_lat_col]),
         crs="EPSG:4326",
     )
 
@@ -227,7 +235,7 @@ def main():
 
     pop_gdf = pop_gdf[pop_keep].copy()
 
-    # IMPORTANT FIX: assign population points to country ONCE (so app can filter before heavy ops)
+    # IMPORTANT FIX: assign population points to country ONCE
     pop_with_country = gpd.sjoin(
         pop_gdf,
         countries[["country", "geometry"]].to_crs(pop_gdf.crs),
@@ -236,6 +244,81 @@ def main():
     ).drop(columns=["index_right"], errors="ignore")
 
     pop_with_country.to_parquet(OUT_POP, index=False)
+
+    # -----------------------
+    # 3b) Precompute population coverage by country & radius
+    # -----------------------
+    # This avoids heavy runtime buffering in Streamlit (population_points is large).
+    RADII_KM = [5, 10, 15, 25, 50]
+
+    def _chunked_union(geoms, chunk_size: int = 250):
+        """Robust unary union in chunks (prevents extremely slow unions)."""
+        from shapely.ops import unary_union
+        geoms = [g for g in geoms if g is not None and (not g.is_empty)]
+        if not geoms:
+            return None
+        parts = []
+        for i in range(0, len(geoms), chunk_size):
+            parts.append(unary_union(geoms[i:i + chunk_size]))
+        return unary_union(parts)
+
+    # Work in a metric CRS for buffering (Web Mercator is sufficient for this best-effort indicator)
+    fac_m = fac_out.to_crs(3857)
+    pop_m = pop_with_country.to_crs(3857)
+
+    has_weight = pop_weight_col is not None and pop_weight_col in pop_with_country.columns
+
+    coverage_rows = []
+    cov_countries = sorted(set(fac_out["country"].dropna().unique()) & set(pop_with_country["country"].dropna().unique()))
+
+    for ctry in cov_countries:
+        f = fac_m[(fac_m["country"] == ctry) & (fac_m["geometry"].notna())].copy()
+        p = pop_m[(pop_m["country"] == ctry) & (pop_m["geometry"].notna())].copy()
+
+        if f.empty or p.empty:
+            continue
+
+        total_points = int(len(p))
+        total_pop = float(pd.to_numeric(p[pop_weight_col], errors="coerce").fillna(0).sum()) if has_weight else None
+
+        # spatial index for fast candidate lookup
+        sidx = p.sindex
+
+        for r_km in RADII_KM:
+            buffers = f.geometry.buffer(float(r_km) * 1000.0)
+            union_poly = _chunked_union(list(buffers), chunk_size=250)
+
+            if union_poly is None or union_poly.is_empty:
+                covered_points = 0
+                covered_pop = 0.0 if has_weight else None
+            else:
+                # fast candidate prefilter using spatial index
+                cand_idx = list(sidx.query(union_poly, predicate="intersects"))
+                if not cand_idx:
+                    covered_points = 0
+                    covered_pop = 0.0 if has_weight else None
+                else:
+                    p_cand = p.iloc[cand_idx]
+                    inside = p_cand.within(union_poly)
+                    covered_points = int(inside.sum())
+                    if has_weight:
+                        covered_pop = float(pd.to_numeric(p_cand.loc[inside, pop_weight_col], errors="coerce").fillna(0).sum())
+                    else:
+                        covered_pop = None
+
+            coverage_rows.append({
+                "country": ctry,
+                "radius_km": int(r_km),
+                "covered_points": int(covered_points),
+                "total_points": int(total_points),
+                "covered_pop": float(covered_pop) if has_weight else None,
+                "total_pop": float(total_pop) if has_weight else None,
+                "has_weight": bool(has_weight),
+                "weight_col": pop_weight_col if has_weight else None,
+            })
+
+    coverage_df = pd.DataFrame(coverage_rows)
+    coverage_df.to_parquet(OUT_COV, index=False)
 
     # -----------------------
     # 4) Metadata
@@ -248,6 +331,8 @@ def main():
         "facility_types": sorted([str(x) for x in fac_out["tp_stbl"].dropna().unique().tolist()]) if "tp_stbl" in fac_out.columns else [],
         "countries_list": sorted([str(x) for x in fac_out["country"].dropna().unique().tolist()]) if "country" in fac_out.columns else [],
         "population_weight_col": pop_weight_col,
+        "precomputed_coverage_file": str(OUT_COV),
+        "precomputed_coverage_radii_km": [5, 10, 15, 25, 50],
     }
 
     with open(OUT_META, "w", encoding="utf-8") as f:
@@ -257,6 +342,7 @@ def main():
     print(" -", OUT_FAC)
     print(" -", OUT_COU)
     print(" -", OUT_POP)
+    print(" -", OUT_COV)
     print(" -", OUT_META)
 
 
