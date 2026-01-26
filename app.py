@@ -2,6 +2,9 @@
 # Run:
 #   streamlit run app.py
 
+import requests
+import re
+
 import json
 import hashlib
 from pathlib import Path
@@ -42,6 +45,69 @@ DISCLAIMER_TEXT = (
     "This dashboard is **for internal use within IDB** only and is **not publicly approved** for external sharing.\n\n"
     "It is intended to support operational design and internal analysis."
 )
+
+# ---------------------------
+# Remote data (Google Drive direct-download)
+# ---------------------------
+DATA_URLS = {
+    "countries.geoparquet": "https://drive.google.com/uc?export=download&id=1YYyBVhRFRJXyMN5hye-wyqe5Y1u2yv9U",
+    "facilities_prepared.geoparquet": "https://drive.google.com/uc?export=download&id=1cptQaSYwMs3HE-Ba5RKdRx-YjChekPO7",
+    "population_coverage_by_country.parquet": "https://drive.google.com/uc?export=download&id=1R4AkxPbbiYTElDverHLRmcfVBUCStUXE",
+}
+
+def _download_gdrive(url: str, out_path: str) -> None:
+    """
+    Download from Google Drive. Handles the 'confirm' interstitial for larger files.
+    """
+    session = requests.Session()
+    r = session.get(url, stream=True, timeout=120)
+    r.raise_for_status()
+
+    # If Drive returns an HTML confirmation page, extract confirm token and retry
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    first = b""
+    it = r.iter_content(chunk_size=4096)
+    try:
+        first = next(it)
+    except StopIteration:
+        first = b""
+
+    def looks_html(b: bytes) -> bool:
+        b2 = b.lstrip().lower()
+        return b2.startswith(b"<!doctype html") or b2.startswith(b"<html")
+
+    if "text/html" in ctype or looks_html(first):
+        html = first + (r.content if hasattr(r, "content") else b"")
+        txt = html.decode("utf-8", errors="ignore")
+        m = re.search(r"confirm=([0-9A-Za-z_]+)", txt)
+        if m:
+            token = m.group(1)
+            url2 = url + f"&confirm={token}"
+            r = session.get(url2, stream=True, timeout=120)
+            r.raise_for_status()
+            it = r.iter_content(chunk_size=1024 * 1024)
+            first = b""
+
+    tmp_path = out_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        if first and not looks_html(first):
+            f.write(first)
+        for chunk in it:
+            if chunk:
+                f.write(chunk)
+
+    Path(tmp_path).replace(out_path)
+
+def ensure_data_files():
+    """
+    Download required parquet/geoparquet files if missing.
+    """
+    for fname, url in DATA_URLS.items():
+        p = Path(f"./{fname}")
+        if not p.exists():
+            with st.spinner(f"Downloading {fname}..."):
+                _download_gdrive(url, str(p))
+
 
 # ---------------------------
 # Helpers
@@ -371,6 +437,8 @@ except Exception:
 # =============================================================================
 # Load prepared data (fast)
 # =============================================================================
+ensure_data_files() 
+
 meta = load_metadata()
 fac0 = load_facilities()
 
